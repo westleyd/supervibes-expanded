@@ -8,9 +8,13 @@ const path = require("path");
 
 const PREFIX = "cc-";
 const FONT_SIZE = 16;
-const WIN_COLS = 38;
-const WIN_ROWS = 44;
+const WIN_COLS = 53;
+const WIN_ROWS = 22;
+const GRID_COLS = 3;
+const GRID_ROWS = 2;
 const WIN_GAP = 10; // pixels between windows
+const GRID_ORIGIN_X = 40;
+const GRID_ORIGIN_Y = 40;
 
 // --- helpers ---
 
@@ -130,15 +134,13 @@ function rearrangeWindows() {
   const sessions = listSessions();
   if (sessions.length === 0) return;
 
-  // Find the first cc- window, ensure it's sized correctly, measure it,
-  // then position all windows left-to-right using that size.
   const firstSess = sessionName(sessions[0]);
-  const topY = 40;
 
-  let positionLogic = "";
+  // First pass: resize all windows
+  let resizeLogic = "";
   for (let i = 0; i < sessions.length; i++) {
     const sess = sessionName(sessions[i]);
-    positionLogic += `
+    resizeLogic += `
     repeat with win in windows
       if name of win contains "${sess}" then
         set number of columns of win to ${WIN_COLS}
@@ -148,14 +150,19 @@ function rearrangeWindows() {
 `;
   }
 
-  // Second pass: measure actual pixel size, then set positions
-  let boundsLogic = "";
+  // Second pass: measure pixel size, then position in 3x3 grid
+  // Fill order: top-to-bottom, then left-to-right
+  // index 0 → (col=0, row=0), 1 → (col=0, row=1), 2 → (col=0, row=2),
+  // 3 → (col=1, row=0), 4 → (col=1, row=1), etc.
+  let gridLogic = "";
   for (let i = 0; i < sessions.length; i++) {
     const sess = sessionName(sessions[i]);
-    boundsLogic += `
+    const col = Math.floor(i / GRID_ROWS);
+    const row = i % GRID_ROWS;
+    gridLogic += `
     repeat with win in windows
       if name of win contains "${sess}" then
-        set position of win to {${topY} + ${i} * (winW + ${WIN_GAP}), ${topY}}
+        set position of win to {${GRID_ORIGIN_X} + ${col} * (winW + ${WIN_GAP}), ${GRID_ORIGIN_Y} + ${row} * (winH + ${WIN_GAP})}
       end if
     end repeat
 `;
@@ -165,23 +172,25 @@ function rearrangeWindows() {
 tell application "Terminal"
   activate
 
-  -- first pass: ensure all cc windows are sized correctly
-  ${positionLogic}
+  -- first pass: resize all cc windows
+  ${resizeLogic}
 
   delay 0.3
 
   -- measure pixel size of first cc window
   set winW to 400
+  set winH to 300
   repeat with win in windows
     if name of win contains "${firstSess}" then
       set b to bounds of win
       set winW to (item 3 of b) - (item 1 of b)
+      set winH to (item 4 of b) - (item 2 of b)
       exit repeat
     end if
   end repeat
 
-  -- second pass: position left to right
-  ${boundsLogic}
+  -- second pass: position in 3x3 grid (top-to-bottom, left-to-right)
+  ${gridLogic}
 end tell`;
   runAppleScript(script);
 }
