@@ -1,20 +1,28 @@
 #!/usr/bin/env node
 "use strict";
 
+/**
+ * tmux-control.cjs — Cross-platform terminal session manager for supervibes.
+ *
+ * Manages tmux sessions and terminal windows across macOS, Linux, and Windows.
+ * Platform-specific behaviour (window opening, grid positioning) is handled by
+ * the appropriate adapter in the platform/ directory.
+ *
+ * On Windows, tmux runs inside WSL2. Set TMUX_CMD=wsl tmux to override the
+ * default, or let auto-detection handle it.
+ */
+
 const { execSync } = require("child_process");
-const fs = require("fs");
-const os = require("os");
-const path = require("path");
+
+const { detectPlatform } = require("./platform/detect.cjs");
+const PLATFORM = detectPlatform();
+const { openTerminalWindow, rearrangeWindows, convertWorkDir } =
+  require(`./platform/${PLATFORM}.cjs`);
+
+// On Windows, tmux lives inside WSL; prefix every tmux call with `wsl`.
+const TMUX = process.env.TMUX_CMD || (PLATFORM === "windows" ? "wsl tmux" : "tmux");
 
 const PREFIX = "cc-";
-const FONT_SIZE = 16;
-const WIN_COLS = 53;
-const WIN_ROWS = 22;
-const GRID_COLS = 3;
-const GRID_ROWS = 2;
-const WIN_GAP = 10; // pixels between windows
-const GRID_ORIGIN_X = 40;
-const GRID_ORIGIN_Y = 40;
 
 // --- helpers ---
 
@@ -33,7 +41,7 @@ function sessionName(name) {
 // --- core functions ---
 
 function listSessions() {
-  const raw = run("tmux list-sessions -F '#{session_name}' 2>/dev/null");
+  const raw = run(`${TMUX} list-sessions -F '#{session_name}' 2>/dev/null`);
   if (!raw) return [];
   return raw
     .split("\n")
@@ -45,48 +53,53 @@ function startSession(name, workDir) {
   const sess = sessionName(name);
 
   // check if session already exists
-  const existing = run(`tmux has-session -t ${sess} 2>/dev/null; echo $?`);
+  const existing = run(`${TMUX} has-session -t ${sess} 2>/dev/null; echo $?`);
   if (existing === "0") {
     console.log(`Session '${name}' already exists.`);
     return;
   }
 
-  const pathEnv = `/opt/homebrew/bin:${process.env.PATH || "/usr/bin:/bin"}`;
+  // On Windows, workDir must be a WSL path (/mnt/c/...) for tmux -c to work.
+  const tmuxWorkDir = convertWorkDir(workDir);
 
-  // Unset CLAUDECODE so nested Claude Code sessions don't detect a parent
+  // Build PATH: use the current PATH without any hardcoded platform prefixes.
+  const pathEnv = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
+
+  // Unset CLAUDECODE so nested Claude Code sessions don't detect a parent.
   run(
-    `tmux new-session -d -s ${sess} -x 120 -y 40 -c "${workDir}" ` +
+    `${TMUX} new-session -d -s ${sess} -x 120 -y 40 -c "${tmuxWorkDir}" ` +
       `-e "CLAUDECODE=" ` +
       `-e "CLAUDE_CODE_ENTRYPOINT=" ` +
       `-e "TERM=xterm-256color" ` +
       `-e "PATH=${pathEnv}"`
   );
 
-  // Unset at the tmux environment level too (prevents inheritance on attach)
-  run(`tmux set-environment -t ${sess} -u CLAUDECODE 2>/dev/null`);
-  run(`tmux set-environment -t ${sess} -u CLAUDE_CODE_ENTRYPOINT 2>/dev/null`);
+  // Unset at the tmux environment level too (prevents inheritance on attach).
+  run(`${TMUX} set-environment -t ${sess} -u CLAUDECODE 2>/dev/null`);
+  run(`${TMUX} set-environment -t ${sess} -u CLAUDE_CODE_ENTRYPOINT 2>/dev/null`);
 
-  // Also send unset commands into the shell to be safe
-  run(`tmux send-keys -t ${sess} 'unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null' Enter`);
+  // Also send unset commands into the shell to be safe.
+  run(
+    `${TMUX} send-keys -t ${sess} 'unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null' Enter`
+  );
 
   openTerminalWindow(sess);
-  rearrangeWindows();
+  rearrangeWindows(listSessions());
   console.log(`Started session '${name}' in ${workDir}`);
 }
 
 function stopSession(name) {
   const sess = sessionName(name);
-  run(`tmux kill-session -t ${sess} 2>/dev/null`);
-  // small delay so Terminal window closes before rearrange
+  run(`${TMUX} kill-session -t ${sess} 2>/dev/null`);
   run("sleep 0.5");
-  rearrangeWindows();
+  rearrangeWindows(listSessions());
   console.log(`Stopped session '${name}'`);
 }
 
 function stopAll() {
   const sessions = listSessions();
   for (const name of sessions) {
-    run(`tmux kill-session -t ${sessionName(name)} 2>/dev/null`);
+    run(`${TMUX} kill-session -t ${sessionName(name)} 2>/dev/null`);
   }
   console.log(
     sessions.length > 0
@@ -98,111 +111,18 @@ function stopAll() {
 function sendKeys(name, text) {
   const sess = sessionName(name);
   if (text === "") {
-    run(`tmux send-keys -t ${sess} Enter`);
+    run(`${TMUX} send-keys -t ${sess} Enter`);
   } else {
     const escaped = text.replace(/'/g, "'\\''");
-    run(`tmux send-keys -t ${sess} -l '${escaped}'`);
-    run(`tmux send-keys -t ${sess} Enter`);
+    run(`${TMUX} send-keys -t ${sess} -l '${escaped}'`);
+    run(`${TMUX} send-keys -t ${sess} Enter`);
   }
 }
 
 function readPane(name, lines = 50) {
   const sess = sessionName(name);
-  const output = run(`tmux capture-pane -t ${sess} -p -S -${lines}`);
+  const output = run(`${TMUX} capture-pane -t ${sess} -p -S -${lines}`);
   console.log(output);
-}
-
-// --- Terminal window management ---
-
-function openTerminalWindow(sess) {
-  const script = `
-tell application "Terminal"
-  activate
-  set prof to settings set "Pro"
-  set font size of prof to ${FONT_SIZE}
-  do script "unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null; tmux attach -t ${sess}"
-  delay 0.5
-  set win to front window
-  set current settings of win to prof
-  set number of columns of win to ${WIN_COLS}
-  set number of rows of win to ${WIN_ROWS}
-end tell`;
-  runAppleScript(script);
-}
-
-function rearrangeWindows() {
-  const sessions = listSessions();
-  if (sessions.length === 0) return;
-
-  const firstSess = sessionName(sessions[0]);
-
-  // First pass: resize all windows
-  let resizeLogic = "";
-  for (let i = 0; i < sessions.length; i++) {
-    const sess = sessionName(sessions[i]);
-    resizeLogic += `
-    repeat with win in windows
-      if name of win contains "${sess}" then
-        set number of columns of win to ${WIN_COLS}
-        set number of rows of win to ${WIN_ROWS}
-      end if
-    end repeat
-`;
-  }
-
-  // Second pass: measure pixel size, then position in 3x3 grid
-  // Fill order: top-to-bottom, then left-to-right
-  // index 0 → (col=0, row=0), 1 → (col=0, row=1), 2 → (col=0, row=2),
-  // 3 → (col=1, row=0), 4 → (col=1, row=1), etc.
-  let gridLogic = "";
-  for (let i = 0; i < sessions.length; i++) {
-    const sess = sessionName(sessions[i]);
-    const col = Math.floor(i / GRID_ROWS);
-    const row = i % GRID_ROWS;
-    gridLogic += `
-    repeat with win in windows
-      if name of win contains "${sess}" then
-        set position of win to {${GRID_ORIGIN_X} + ${col} * (winW + ${WIN_GAP}), ${GRID_ORIGIN_Y} + ${row} * (winH + ${WIN_GAP})}
-      end if
-    end repeat
-`;
-  }
-
-  const script = `
-tell application "Terminal"
-  activate
-
-  -- first pass: resize all cc windows
-  ${resizeLogic}
-
-  delay 0.3
-
-  -- measure pixel size of first cc window
-  set winW to 400
-  set winH to 300
-  repeat with win in windows
-    if name of win contains "${firstSess}" then
-      set b to bounds of win
-      set winW to (item 3 of b) - (item 1 of b)
-      set winH to (item 4 of b) - (item 2 of b)
-      exit repeat
-    end if
-  end repeat
-
-  -- second pass: position in 3x3 grid (top-to-bottom, left-to-right)
-  ${gridLogic}
-end tell`;
-  runAppleScript(script);
-}
-
-function runAppleScript(script) {
-  const tmp = path.join(os.tmpdir(), `tmux-control-${Date.now()}.scpt`);
-  fs.writeFileSync(tmp, script);
-  try {
-    run(`osascript ${tmp}`);
-  } finally {
-    try { fs.unlinkSync(tmp); } catch (_) {}
-  }
 }
 
 // --- CLI ---
@@ -286,7 +206,10 @@ function printUsage() {
   --read <name> [lines]   Read output (default 50 lines)
   --stop <name>           Stop a session
   --stop-all              Stop all sessions
-  --list                  List active sessions`);
+  --list                  List active sessions
+
+Environment variables:
+  TMUX_CMD    Override the tmux command (default: 'tmux' on macOS/Linux, 'wsl tmux' on Windows)`);
 }
 
 main();

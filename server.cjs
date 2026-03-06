@@ -20,7 +20,7 @@ You have the following tool available — a CLI script you run via shell:
 
 ## tmux-control.cjs commands
 
-# Start a new terminal (opens a macOS Terminal window with Claude Code-ready env)
+# Start a new terminal window with a Claude Code-ready environment
 node ${TMUX_CONTROL} --start <name> <working-dir>
 
 # Send a command to a terminal
