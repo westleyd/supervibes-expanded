@@ -4,9 +4,10 @@
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
+const readline = require("readline");
 const { execSync, spawn } = require("child_process");
 
-const PORT = 3456;
+const PORT = parseInt(process.env.PORT, 10) || 3456;
 const TMUX_CONTROL = path.join(__dirname, "tmux-control.cjs");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const MAX_BUFFER_LINES = 500;
@@ -550,6 +551,70 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log(`Dashboard: http://localhost:${PORT}`);
+// --- Port conflict helpers ---
+
+function getPortOwnerPid(port) {
+  try {
+    const out = execSync(`fuser ${port}/tcp 2>/dev/null`, { encoding: "utf-8" });
+    return out.trim().split(/\s+/)[0] || null;
+  } catch (_) { return null; }
+}
+
+function isOwnProcess(pid) {
+  try {
+    const cmd = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
+    return cmd.includes("server.cjs");
+  } catch (_) { return false; }
+}
+
+function startListening() {
+  server.listen(PORT, () => {
+    console.log(`Dashboard: http://localhost:${PORT}`);
+  });
+}
+
+server.on("error", (err) => {
+  if (err.code !== "EADDRINUSE") throw err;
+
+  const pid = getPortOwnerPid(PORT);
+  const isOwn = pid && isOwnProcess(pid);
+
+  if (!isOwn) {
+    console.error(
+      `[supervibes] Port ${PORT} is in use by another process` +
+      (pid ? ` (PID ${pid})` : "") + `.\n` +
+      `  Run on a different port:  PORT=3457 node server.cjs`
+    );
+    process.exit(1);
+  }
+
+  console.warn(
+    `\n[supervibes] A previous server is already running on port ${PORT} (PID ${pid}).` +
+    `\n  It may have an active orchestration run in progress.`
+  );
+
+  if (!process.stdin.isTTY) {
+    console.error(
+      `  Cannot prompt in non-interactive mode.\n` +
+      `  Stop PID ${pid} manually, or set PORT=<other> to use a different port.`
+    );
+    process.exit(1);
+  }
+
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  rl.question("  Kill it and start fresh? [y/N] ", (answer) => {
+    rl.close();
+    if (answer.trim().toLowerCase() === "y") {
+      try { execSync(`kill ${pid}`); } catch (_) {}
+      setTimeout(startListening, 1500);
+    } else {
+      console.log(
+        "  Exiting. Stop the other server first, or run:\n" +
+        `    PORT=3457 node server.cjs`
+      );
+      process.exit(0);
+    }
+  });
 });
+
+startListening();

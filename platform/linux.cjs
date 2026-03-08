@@ -29,6 +29,10 @@ const CHAR_H = 18;
 const WIN_PADDING_W = 20;
 const WIN_PADDING_H = 50;
 
+function isWayland() {
+  return !!process.env.WAYLAND_DISPLAY;
+}
+
 function run(cmd) {
   try {
     return execSync(cmd, { encoding: "utf-8", timeout: 15000 }).trimEnd();
@@ -56,16 +60,23 @@ function detectTerminalEmulator() {
 function buildTerminalCmd(term, sess) {
   const attach =
     `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null; tmux attach -t ${sess}`;
+  // On Wayland, GTK/Qt terminals open as Wayland-native windows which wmctrl cannot
+  // see or position. Forcing the X11 backend makes them run via XWayland instead,
+  // restoring wmctrl grid positioning without requiring any extra tools.
+  const gtkX11  = isWayland() ? "GDK_BACKEND=x11 " : "";
+  const qtX11   = isWayland() ? "QT_QPA_PLATFORM=xcb " : "";
+
   switch (term) {
     case "gnome-terminal":
-      return `gnome-terminal --title="${sess}" -- bash -c '${attach}; exec bash'`;
+      return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}; exec bash'`;
     case "konsole":
-      return `konsole --title "${sess}" -e bash -c '${attach}; exec bash'`;
+      return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}; exec bash'`;
     case "xfce4-terminal":
       // xfce4-terminal -e takes a single string
-      return `xfce4-terminal --title="${sess}" -e "bash -c '${attach}; exec bash'"`;
+      return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}; exec bash'"`;
     case "xterm":
     default:
+      // xterm is always X11-native — no prefix needed
       return `xterm -title "${sess}" -e bash -c '${attach}'`;
   }
 }
@@ -91,9 +102,12 @@ function rearrangeWindows(sessions) {
   const hasXdotool = which("xdotool");
 
   if (!hasWmctrl && !hasXdotool) {
+    const waylandNote = isWayland()
+      ? "\n  On Wayland, GDK_BACKEND=x11 is set automatically — wmctrl should work."
+      : "";
     console.warn(
       "[supervibes] Window positioning skipped — neither wmctrl nor xdotool found.\n" +
-      "  Install wmctrl: sudo apt install wmctrl"
+      "  Install wmctrl: sudo apt install wmctrl" + waylandNote
     );
     return;
   }
