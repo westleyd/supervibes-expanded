@@ -143,6 +143,7 @@ const state = {
   goal: "",
   terminalCount: "auto",
   model: "sonnet",
+  workerModel: "haiku",   // model used by worker agents (can differ from controller)
   iterations: 0,          // total iterations requested
   currentIteration: 0,    // 0 = initial build, 1+ = improvement iterations
   sessions: [],
@@ -220,7 +221,7 @@ function stopPolling() {
 
 // --- Controller process ---
 
-function buildPrompt(goal, terminalCount, model, iteration) {
+function buildPrompt(goal, terminalCount, model, iteration, workerModel) {
   let terminalInstruction = "";
   if (terminalCount === "auto") {
     terminalInstruction = "Decide how many terminals to use based on the goal. If possible, operate in parallel to improve dev speed.";
@@ -228,7 +229,8 @@ function buildPrompt(goal, terminalCount, model, iteration) {
     terminalInstruction = `Use exactly ${terminalCount} terminal(s). Name them appropriately for the task.`;
   }
 
-  const modelInstruction = `When launching Claude Code in each terminal, use: claude --dangerously-skip-permissions --model ${model || "sonnet"}`;
+  const wModel = workerModel || model || "sonnet";
+  const modelInstruction = `When launching Claude Code in each terminal, use: claude --dangerously-skip-permissions --model ${wModel}`;
 
   let goalSection = "";
   if (iteration === 0) {
@@ -249,8 +251,8 @@ Original goal for context: ${goal}`;
   return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}\n\n${goalSection}`;
 }
 
-function spawnController(goal, terminalCount, model, iteration) {
-  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0);
+function spawnController(goal, terminalCount, model, iteration, workerModel) {
+  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel);
 
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
@@ -272,6 +274,7 @@ function spawnController(goal, terminalCount, model, iteration) {
   state.goal = goal;
   state.terminalCount = terminalCount;
   state.model = model || "sonnet";
+  state.workerModel = workerModel || state.model;
   state.controllerOutput = [];
   state.sessions = [];
 
@@ -383,7 +386,7 @@ function spawnController(goal, terminalCount, model, iteration) {
 
       // Small delay before next iteration
       setTimeout(() => {
-        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration);
+        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel);
       }, 2000);
     } else {
       state.running = false;
@@ -470,13 +473,14 @@ const server = http.createServer(async (req, res) => {
       ? "auto"
       : parseInt(body.terminalCount, 10);
     const model = body.model || "sonnet";
+    const workerModel = body.workerModel || model;
     const iterations = Math.min(Math.max(parseInt(body.iterations) || 0, 0), 5);
 
     state.iterations = iterations;
     state.currentIteration = 0;
     state.stopped = false;
 
-    spawnController(goal, terminalCount, model, 0);
+    spawnController(goal, terminalCount, model, 0, workerModel);
     return sendJson(res, 200, { ok: true });
   }
 
@@ -491,6 +495,7 @@ const server = http.createServer(async (req, res) => {
       goal: state.goal,
       terminalCount: state.terminalCount,
       model: state.model,
+      workerModel: state.workerModel,
       iterations: state.iterations,
       currentIteration: state.currentIteration,
       sessions: state.sessions,
@@ -512,6 +517,7 @@ const server = http.createServer(async (req, res) => {
       goal: state.goal,
       terminalCount: state.terminalCount,
       model: state.model,
+      workerModel: state.workerModel,
       iterations: state.iterations,
       currentIteration: state.currentIteration,
       controllerOutput: state.controllerOutput,

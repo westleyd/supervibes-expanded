@@ -4,11 +4,21 @@
 /**
  * Linux platform adapter for supervibes.
  *
- * Terminal emulator: auto-detects gnome-terminal → konsole → xfce4-terminal → xterm
+ * Terminal emulator:
+ *   X11  — gnome-terminal → konsole → xfce4-terminal → xterm
+ *   Wayland — xterm (preferred) → gnome-terminal → konsole → xfce4-terminal
+ *
+ *   On Wayland, gnome-terminal/konsole/xfce4-terminal use a D-Bus factory model:
+ *   new windows are created by a server daemon that ignores GDK_BACKEND=x11 on
+ *   the client side. xterm has no factory model and is always X11/XWayland-native,
+ *   so wmctrl can see and position its windows correctly.
+ *
  * Window positioning: wmctrl (preferred) → xdotool (fallback) → graceful skip
  *
  * Prerequisites (Ubuntu/Debian):
  *   sudo apt install tmux wmctrl
+ *   # For Wayland grid positioning:
+ *   sudo apt install xterm
  *   # Optional for xdotool fallback:
  *   sudo apt install xdotool
  */
@@ -51,7 +61,14 @@ function which(cmd) {
 }
 
 function detectTerminalEmulator() {
-  for (const term of ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"]) {
+  // On Wayland, GTK/Qt terminals use a D-Bus factory model: the daemon that creates
+  // windows ignores GDK_BACKEND=x11 set on the client, so new windows remain
+  // Wayland-native and are invisible to wmctrl. xterm has no factory — it is always
+  // an XWayland window — so prefer it on Wayland for reliable grid positioning.
+  const order = isWayland()
+    ? ["xterm", "gnome-terminal", "konsole", "xfce4-terminal"]
+    : ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"];
+  for (const term of order) {
     if (which(term)) return term;
   }
   return null;
@@ -60,9 +77,10 @@ function detectTerminalEmulator() {
 function buildTerminalCmd(term, sess) {
   const attach =
     `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null; tmux attach -t ${sess}`;
-  // On Wayland, GTK/Qt terminals open as Wayland-native windows which wmctrl cannot
-  // see or position. Forcing the X11 backend makes them run via XWayland instead,
-  // restoring wmctrl grid positioning without requiring any extra tools.
+  // GDK_BACKEND=x11 / QT_QPA_PLATFORM=xcb help only when the terminal's D-Bus
+  // server daemon is not already running; if it is, the daemon ignores these vars.
+  // On Wayland, detectTerminalEmulator() prefers xterm which has no factory model.
+  // These prefixes are kept here as a best-effort fallback for edge cases.
   const gtkX11  = isWayland() ? "GDK_BACKEND=x11 " : "";
   const qtX11   = isWayland() ? "QT_QPA_PLATFORM=xcb " : "";
 
@@ -84,9 +102,13 @@ function buildTerminalCmd(term, sess) {
 function openTerminalWindow(sess) {
   const term = detectTerminalEmulator();
   if (!term) {
+    const waylandHint = isWayland()
+      ? "\n  On Wayland, xterm is required for grid positioning: sudo apt install xterm"
+      : "";
     console.warn(
       "[supervibes] No supported terminal emulator found.\n" +
-      "  Install one: sudo apt install gnome-terminal  (or konsole / xfce4-terminal / xterm)"
+      "  Install one: sudo apt install gnome-terminal  (or xterm, konsole, xfce4-terminal)" +
+      waylandHint
     );
     return;
   }
@@ -103,7 +125,7 @@ function rearrangeWindows(sessions) {
 
   if (!hasWmctrl && !hasXdotool) {
     const waylandNote = isWayland()
-      ? "\n  On Wayland, GDK_BACKEND=x11 is set automatically — wmctrl should work."
+      ? "\n  On Wayland, also install xterm for X11-compatible windows: sudo apt install xterm"
       : "";
     console.warn(
       "[supervibes] Window positioning skipped — neither wmctrl nor xdotool found.\n" +

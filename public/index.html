@@ -301,10 +301,15 @@
     <option value="5">5 Terminals</option>
     <option value="6">6 Terminals</option>
   </select>
-  <select id="modelSelect">
+  <select id="modelSelect" title="Controller model">
     <option value="sonnet">Sonnet</option>
     <option value="opus">Opus</option>
     <option value="haiku">Haiku</option>
+  </select>
+  <select id="workerModelSelect" title="Worker (agent) model">
+    <option value="haiku">Workers: Haiku</option>
+    <option value="sonnet">Workers: Sonnet</option>
+    <option value="opus">Workers: Opus</option>
   </select>
   <select id="iterationSelect">
     <option value="0">0 Iterations</option>
@@ -344,6 +349,7 @@
   const goalInput = document.getElementById("goalInput");
   const terminalSelect = document.getElementById("terminalSelect");
   const modelSelect = document.getElementById("modelSelect");
+  const workerModelSelect = document.getElementById("workerModelSelect");
   const iterationSelect = document.getElementById("iterationSelect");
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
@@ -467,6 +473,7 @@
     goalInput.disabled = running;
     terminalSelect.disabled = running;
     modelSelect.disabled = running;
+    workerModelSelect.disabled = running;
     iterationSelect.disabled = running;
   }
 
@@ -607,6 +614,7 @@
       if (data.goal) goalInput.value = data.goal;
       if (data.terminalCount) terminalSelect.value = String(data.terminalCount);
       if (data.model) modelSelect.value = data.model;
+      if (data.workerModel) workerModelSelect.value = data.workerModel;
       if (data.iterations !== undefined) iterationSelect.value = String(data.iterations);
 
       // Re-parse all buffered lines into log entries
@@ -660,6 +668,7 @@
 
     const terminalCount = terminalSelect.value;
     const model = modelSelect.value;
+    const workerModel = workerModelSelect.value;
     const iterations = parseInt(iterationSelect.value) || 0;
     currentIter = 0;
     totalIters = iterations;
@@ -674,7 +683,7 @@
       const res = await fetch("/api/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal, terminalCount, model, iterations }),
+        body: JSON.stringify({ goal, terminalCount, model, workerModel, iterations }),
       });
       const data = await res.json();
       if (!res.ok) alert(data.error || "Failed to start");
@@ -701,6 +710,7 @@
       if (data.goal) goalInput.value = data.goal;
       if (data.terminalCount) terminalSelect.value = String(data.terminalCount);
       if (data.model) modelSelect.value = data.model;
+      if (data.workerModel) workerModelSelect.value = data.workerModel;
       if (data.iterations !== undefined) iterationSelect.value = String(data.iterations);
     })
     .catch(() => {})
