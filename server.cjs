@@ -144,6 +144,8 @@ const state = {
   terminalCount: "auto",
   model: "sonnet",
   workerModel: "haiku",   // model used by worker agents (can differ from controller)
+  githubRepo: "",         // raw GitHub input from UI (owner/repo or full URL)
+  workDir: "",            // resolved absolute path used as agent working directory
   iterations: 0,          // total iterations requested
   currentIteration: 0,    // 0 = initial build, 1+ = improvement iterations
   sessions: [],
@@ -219,9 +221,52 @@ function stopPolling() {
   }
 }
 
+// --- Git clone helper ---
+
+/**
+ * Clones or updates a GitHub repository into a local workspaces/ directory.
+ * @param {string} repoInput - "owner/repo" shorthand or full https/ssh URL
+ * @param {string|undefined} targetDir - optional override for clone destination
+ * @returns {string} resolved absolute path to the repo directory
+ */
+function cloneOrPullRepo(repoInput, targetDir) {
+  let repoUrl = repoInput.trim();
+  if (!repoUrl.startsWith("https://") && !repoUrl.startsWith("git@")) {
+    repoUrl = `https://github.com/${repoUrl}`;
+  }
+
+  // Derive a filesystem-safe slug from the URL path: "owner/repo" → "owner-repo"
+  const urlObj = new URL(repoUrl);
+  const slug = urlObj.pathname
+    .replace(/^\//, "")
+    .replace(/\.git$/, "")
+    .replace(/\//g, "-");
+
+  const resolvedDir = targetDir
+    ? path.resolve(targetDir)
+    : path.join(__dirname, "workspaces", slug);
+
+  // Ensure parent directory exists
+  fs.mkdirSync(path.dirname(resolvedDir), { recursive: true });
+
+  if (fs.existsSync(path.join(resolvedDir, ".git"))) {
+    console.log(`[supervibes] Pulling latest in ${resolvedDir}`);
+    try {
+      execSync("git pull --ff-only", { cwd: resolvedDir, encoding: "utf-8", timeout: 60000 });
+    } catch (e) {
+      console.warn("[supervibes] git pull failed, using existing checkout:", e.message);
+    }
+  } else {
+    console.log(`[supervibes] Cloning ${repoUrl} → ${resolvedDir}`);
+    execSync(`git clone "${repoUrl}" "${resolvedDir}"`, { encoding: "utf-8", timeout: 120000 });
+  }
+
+  return resolvedDir;
+}
+
 // --- Controller process ---
 
-function buildPrompt(goal, terminalCount, model, iteration, workerModel) {
+function buildPrompt(goal, terminalCount, model, iteration, workerModel, workDir) {
   let terminalInstruction = "";
   if (terminalCount === "auto") {
     terminalInstruction = "Decide how many terminals to use based on the goal. If possible, operate in parallel to improve dev speed.";
@@ -231,6 +276,10 @@ function buildPrompt(goal, terminalCount, model, iteration, workerModel) {
 
   const wModel = workerModel || model || "sonnet";
   const modelInstruction = `When launching Claude Code in each terminal, use: claude --dangerously-skip-permissions --model ${wModel}`;
+
+  const workDirInstruction = workDir
+    ? `\n\n## Working Directory\n\nThe project is located at:\n\n    ${workDir}\n\nWhen starting agent terminals, always pass this path as the working directory:\n\n    node ${TMUX_CONTROL} --start <name> "${workDir}"`
+    : "";
 
   let goalSection = "";
   if (iteration === 0) {
@@ -248,11 +297,11 @@ The project below was already built in a previous round. Your job now:
 Original goal for context: ${goal}`;
   }
 
-  return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}\n\n${goalSection}`;
+  return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}${workDirInstruction}\n\n${goalSection}`;
 }
 
-function spawnController(goal, terminalCount, model, iteration, workerModel) {
-  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel);
+function spawnController(goal, terminalCount, model, iteration, workerModel, workDir) {
+  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel, workDir);
 
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
@@ -275,6 +324,7 @@ function spawnController(goal, terminalCount, model, iteration, workerModel) {
   state.terminalCount = terminalCount;
   state.model = model || "sonnet";
   state.workerModel = workerModel || state.model;
+  state.workDir = workDir || "";
   state.controllerOutput = [];
   state.sessions = [];
 
@@ -386,7 +436,7 @@ function spawnController(goal, terminalCount, model, iteration, workerModel) {
 
       // Small delay before next iteration
       setTimeout(() => {
-        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel);
+        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
       }, 2000);
     } else {
       state.running = false;
@@ -476,17 +526,39 @@ const server = http.createServer(async (req, res) => {
     const workerModel = body.workerModel || model;
     const iterations = Math.min(Math.max(parseInt(body.iterations) || 0, 0), 5);
 
+    // Resolve working directory (clone GitHub repo if provided)
+    let workDir = (body.workDir || "").trim();
+    const githubRepo = (body.githubRepo || "").trim();
+    if (githubRepo) {
+      try {
+        workDir = cloneOrPullRepo(githubRepo, workDir || undefined);
+      } catch (err) {
+        return sendJson(res, 500, { error: "Git clone failed: " + err.message });
+      }
+    }
+
     state.iterations = iterations;
     state.currentIteration = 0;
     state.stopped = false;
+    state.githubRepo = githubRepo;
 
-    spawnController(goal, terminalCount, model, 0, workerModel);
-    return sendJson(res, 200, { ok: true });
+    spawnController(goal, terminalCount, model, 0, workerModel, workDir);
+    return sendJson(res, 200, { ok: true, workDir });
   }
 
   if (pathname === "/api/stop" && req.method === "POST") {
     stopController();
     return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/shutdown" && req.method === "POST") {
+    if (state.running) stopController();
+    sendJson(res, 200, { ok: true });
+    setTimeout(() => {
+      console.log("[supervibes] Shutdown requested via web UI — exiting.");
+      process.exit(0);
+    }, 400);
+    return;
   }
 
   if (pathname === "/api/status" && req.method === "GET") {
@@ -496,6 +568,8 @@ const server = http.createServer(async (req, res) => {
       terminalCount: state.terminalCount,
       model: state.model,
       workerModel: state.workerModel,
+      githubRepo: state.githubRepo,
+      workDir: state.workDir,
       iterations: state.iterations,
       currentIteration: state.currentIteration,
       sessions: state.sessions,
@@ -518,6 +592,8 @@ const server = http.createServer(async (req, res) => {
       terminalCount: state.terminalCount,
       model: state.model,
       workerModel: state.workerModel,
+      githubRepo: state.githubRepo,
+      workDir: state.workDir,
       iterations: state.iterations,
       currentIteration: state.currentIteration,
       controllerOutput: state.controllerOutput,

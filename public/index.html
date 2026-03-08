@@ -42,29 +42,31 @@
   }
   .status-dot.running { background: #3fb950; }
 
-  /* --- Controls --- */
+  /* --- Controls: 3-row layout --- */
   .controls {
     display: flex;
-    align-items: center;
-    gap: 10px;
+    flex-direction: column;
+    gap: 8px;
     padding: 10px 20px;
     background: #161b22;
     border-bottom: 1px solid #30363d;
     flex-shrink: 0;
   }
-
-  .controls input[type="text"] {
-    flex: 1;
-    padding: 8px 12px;
-    background: #0d1117;
-    border: 1px solid #30363d;
-    border-radius: 6px;
-    color: #e6edf3;
-    font-size: 14px;
-    outline: none;
+  .controls-goal { width: 100%; }
+  .controls-project {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
   }
-  .controls input[type="text"]:focus { border-color: #58a6ff; }
-
+  .controls-options {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+  .controls textarea,
+  .controls input[type="text"],
   .controls select {
     padding: 8px 12px;
     background: #0d1117;
@@ -72,10 +74,27 @@
     border-radius: 6px;
     color: #e6edf3;
     font-size: 14px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
     outline: none;
-    cursor: pointer;
   }
-
+  .controls textarea:focus,
+  .controls input[type="text"]:focus,
+  .controls select:focus { border-color: #58a6ff; }
+  .controls textarea#goalInput {
+    width: 100%;
+    resize: vertical;
+    min-height: 68px;
+    line-height: 1.5;
+    box-sizing: border-box;
+  }
+  .controls input.project-input { flex: 1; min-width: 180px; }
+  .controls .project-label {
+    font-size: 12px;
+    color: #8b949e;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+  .controls select { cursor: pointer; }
   .controls button {
     padding: 8px 16px;
     border: none;
@@ -84,11 +103,13 @@
     font-weight: 500;
     cursor: pointer;
     transition: opacity 0.15s;
+    white-space: nowrap;
   }
-  .controls button:hover { opacity: 0.85; }
+  .controls button:hover   { opacity: 0.85; }
   .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
-  .btn-start { background: #238636; color: #fff; }
-  .btn-stop { background: #da3633; color: #fff; }
+  .btn-start    { background: #238636; color: #fff; }
+  .btn-stop     { background: #da3633; color: #fff; }
+  .btn-shutdown { background: #6e40c9; color: #fff; }
 
   /* --- Main Layout --- */
   .main {
@@ -291,36 +312,56 @@
 </header>
 
 <div class="controls">
-  <input type="text" id="goalInput" placeholder="Enter your goal..." />
-  <select id="terminalSelect">
-    <option value="auto">Auto</option>
-    <option value="1">1 Terminal</option>
-    <option value="2">2 Terminals</option>
-    <option value="3">3 Terminals</option>
-    <option value="4">4 Terminals</option>
-    <option value="5">5 Terminals</option>
-    <option value="6">6 Terminals</option>
-  </select>
-  <select id="modelSelect" title="Controller model">
-    <option value="sonnet">Sonnet</option>
-    <option value="opus">Opus</option>
-    <option value="haiku">Haiku</option>
-  </select>
-  <select id="workerModelSelect" title="Worker (agent) model">
-    <option value="haiku">Workers: Haiku</option>
-    <option value="sonnet">Workers: Sonnet</option>
-    <option value="opus">Workers: Opus</option>
-  </select>
-  <select id="iterationSelect">
-    <option value="0">0 Iterations</option>
-    <option value="1">1 Iteration</option>
-    <option value="2">2 Iterations</option>
-    <option value="3">3 Iterations</option>
-    <option value="4">4 Iterations</option>
-    <option value="5">5 Iterations</option>
-  </select>
-  <button class="btn-start" id="btnStart" onclick="doStart()">Start</button>
-  <button class="btn-stop" id="btnStop" onclick="doStop()" disabled>Stop</button>
+
+  <!-- Row 1: Goal textarea -->
+  <div class="controls-goal">
+    <textarea id="goalInput" rows="3" placeholder="Enter your goal... (Ctrl+Enter to start)"></textarea>
+  </div>
+
+  <!-- Row 2: Project inputs -->
+  <div class="controls-project">
+    <span class="project-label">GitHub:</span>
+    <input type="text" id="githubRepoInput" class="project-input"
+           placeholder="owner/repo or https://github.com/owner/repo" />
+    <span class="project-label">Work dir:</span>
+    <input type="text" id="workDirInput" class="project-input"
+           placeholder="/path/to/project (leave blank for default)" />
+  </div>
+
+  <!-- Row 3: Options + buttons -->
+  <div class="controls-options">
+    <select id="terminalSelect">
+      <option value="auto">Auto</option>
+      <option value="1">1 Terminal</option>
+      <option value="2">2 Terminals</option>
+      <option value="3">3 Terminals</option>
+      <option value="4">4 Terminals</option>
+      <option value="5">5 Terminals</option>
+      <option value="6">6 Terminals</option>
+    </select>
+    <select id="modelSelect" title="Controller model">
+      <option value="sonnet">Sonnet</option>
+      <option value="opus">Opus</option>
+      <option value="haiku">Haiku</option>
+    </select>
+    <select id="workerModelSelect" title="Worker (agent) model">
+      <option value="haiku">Workers: Haiku</option>
+      <option value="sonnet">Workers: Sonnet</option>
+      <option value="opus">Workers: Opus</option>
+    </select>
+    <select id="iterationSelect">
+      <option value="0">0 Iterations</option>
+      <option value="1">1 Iteration</option>
+      <option value="2">2 Iterations</option>
+      <option value="3">3 Iterations</option>
+      <option value="4">4 Iterations</option>
+      <option value="5">5 Iterations</option>
+    </select>
+    <button class="btn-start"    id="btnStart"    onclick="doStart()">Start</button>
+    <button class="btn-stop"     id="btnStop"     onclick="doStop()"     disabled>Stop</button>
+    <button class="btn-shutdown" id="btnShutdown" onclick="doShutdown()">Shutdown</button>
+  </div>
+
 </div>
 
 <div class="main">
@@ -353,6 +394,9 @@
   const iterationSelect = document.getElementById("iterationSelect");
   const btnStart = document.getElementById("btnStart");
   const btnStop = document.getElementById("btnStop");
+  const btnShutdown = document.getElementById("btnShutdown");
+  const githubRepoInput = document.getElementById("githubRepoInput");
+  const workDirInput = document.getElementById("workDirInput");
   const statusDot = document.getElementById("statusDot");
   const statusText = document.getElementById("statusText");
   const logBody = document.getElementById("logBody");
@@ -475,6 +519,9 @@
     modelSelect.disabled = running;
     workerModelSelect.disabled = running;
     iterationSelect.disabled = running;
+    githubRepoInput.disabled = running;
+    workDirInput.disabled = running;
+    btnShutdown.disabled = false;  // always clickable
   }
 
   function isNearBottom(el) {
@@ -616,6 +663,8 @@
       if (data.model) modelSelect.value = data.model;
       if (data.workerModel) workerModelSelect.value = data.workerModel;
       if (data.iterations !== undefined) iterationSelect.value = String(data.iterations);
+      if (data.githubRepo) githubRepoInput.value = data.githubRepo;
+      if (data.workDir)    workDirInput.value    = data.workDir;
 
       // Re-parse all buffered lines into log entries
       controllerLines = data.controllerOutput || [];
@@ -670,6 +719,8 @@
     const model = modelSelect.value;
     const workerModel = workerModelSelect.value;
     const iterations = parseInt(iterationSelect.value) || 0;
+    const githubRepo = githubRepoInput.value.trim();
+    const workDir = workDirInput.value.trim();
     currentIter = 0;
     totalIters = iterations;
     controllerLines = [];
@@ -683,10 +734,12 @@
       const res = await fetch("/api/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ goal, terminalCount, model, workerModel, iterations }),
+        body: JSON.stringify({ goal, terminalCount, model, workerModel, iterations, githubRepo, workDir }),
       });
       const data = await res.json();
-      if (!res.ok) alert(data.error || "Failed to start");
+      if (!res.ok) { alert(data.error || "Failed to start"); return; }
+      // Auto-fill the resolved workDir (e.g. after a git clone)
+      if (data.workDir) workDirInput.value = data.workDir;
     } catch (err) {
       alert("Failed to connect to server");
     }
@@ -696,8 +749,16 @@
     try { await fetch("/api/stop", { method: "POST" }); } catch (_) {}
   };
 
+  window.doShutdown = async function() {
+    if (!confirm("Shutdown the server? This stops all agents and exits the Node.js process.")) return;
+    try { await fetch("/api/shutdown", { method: "POST" }); } catch (_) {}
+    statusText.textContent = "Server shut down";
+    statusDot.className = "status-dot stopped";
+  };
+
   goalInput.addEventListener("keydown", function(e) {
-    if (e.key === "Enter" && !isRunning) doStart();
+    // Textarea uses plain Enter for newlines — use Ctrl/Cmd+Enter to start
+    if (e.key === "Enter" && (e.ctrlKey || e.metaKey) && !isRunning) doStart();
   });
 
   // --- Init ---
@@ -712,6 +773,8 @@
       if (data.model) modelSelect.value = data.model;
       if (data.workerModel) workerModelSelect.value = data.workerModel;
       if (data.iterations !== undefined) iterationSelect.value = String(data.iterations);
+      if (data.githubRepo) githubRepoInput.value = data.githubRepo;
+      if (data.workDir)    workDirInput.value    = data.workDir;
     })
     .catch(() => {})
     .finally(() => connectSSE());
