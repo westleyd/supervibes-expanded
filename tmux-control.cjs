@@ -16,8 +16,9 @@ const { execSync } = require("child_process");
 
 const { detectPlatform } = require("./platform/detect.cjs");
 const PLATFORM = detectPlatform();
-const { openTerminalWindow, rearrangeWindows, convertWorkDir } =
-  require(`./platform/${PLATFORM}.cjs`);
+const platformAdapter = require(`./platform/${PLATFORM}.cjs`);
+const { openTerminalWindow, rearrangeWindows, convertWorkDir } = platformAdapter;
+const closeAllWindows = platformAdapter.closeAllWindows || (() => {});
 
 // On Windows, tmux lives inside WSL; prefix every tmux call with `wsl`.
 const TMUX = process.env.TMUX_CMD || (PLATFORM === "windows" ? "wsl tmux" : "tmux");
@@ -101,6 +102,9 @@ function stopAll() {
   for (const name of sessions) {
     run(`${TMUX} kill-session -t ${sessionName(name)} 2>/dev/null`);
   }
+  // Close any lingering terminal windows so they don't accumulate across
+  // iterations and hide newly opened windows.
+  closeAllWindows();
   console.log(
     sessions.length > 0
       ? `Stopped all sessions: ${sessions.join(", ")}`

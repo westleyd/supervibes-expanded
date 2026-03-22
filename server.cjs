@@ -434,10 +434,11 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       broadcast("controller", { line: iterMsg });
       broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
 
-      // Small delay before next iteration
+      // Delay before next iteration — give terminal windows time to fully close
+      // after stopAll so new windows don't collide with stale ones.
       setTimeout(() => {
         spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
-      }, 2000);
+      }, 3000);
     } else {
       state.running = false;
       const reason = state.stopped ? "Stopped by user" : `Controller exited with code ${code}`;

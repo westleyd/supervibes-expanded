@@ -86,12 +86,14 @@ function buildTerminalCmd(term, sess) {
 
   switch (term) {
     case "gnome-terminal":
-      return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}; exec bash'`;
+      // No 'exec bash' — let the window close when tmux exits so stale windows
+      // don't accumulate across iterations.
+      return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}'`;
     case "konsole":
-      return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}; exec bash'`;
+      return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}'`;
     case "xfce4-terminal":
       // xfce4-terminal -e takes a single string
-      return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}; exec bash'"`;
+      return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}'"`;
     case "xterm":
     default:
       // xterm is always X11-native — no prefix needed
@@ -117,6 +119,37 @@ function openTerminalWindow(sess) {
   execSync(`${cmd} &`, { timeout: 5000, shell: "/bin/bash" });
 }
 
+/**
+ * Close all terminal windows whose title contains a cc- session name.
+ * Called during stopAll to prevent stale windows from accumulating across
+ * iterations.
+ */
+function closeAllWindows() {
+  const hasWmctrl = which("wmctrl");
+  const hasXdotool = which("xdotool");
+
+  if (hasWmctrl) {
+    // wmctrl -l lists all windows; grep for cc- prefix, then close each
+    const list = run(`wmctrl -l 2>/dev/null`);
+    if (list) {
+      for (const line of list.split("\n")) {
+        if (line.includes(PREFIX)) {
+          // Extract window ID (first column)
+          const wid = line.trim().split(/\s+/)[0];
+          if (wid) run(`wmctrl -i -c ${wid} 2>/dev/null`);
+        }
+      }
+    }
+  } else if (hasXdotool) {
+    const wids = run(`xdotool search --name "${PREFIX}" 2>/dev/null`);
+    if (wids) {
+      for (const wid of wids.split("\n")) {
+        if (wid.trim()) run(`xdotool windowclose ${wid.trim()} 2>/dev/null`);
+      }
+    }
+  }
+}
+
 function rearrangeWindows(sessions) {
   if (sessions.length === 0) return;
 
@@ -134,8 +167,9 @@ function rearrangeWindows(sessions) {
     return;
   }
 
-  // Give windows a moment to appear before we try to position them
-  run("sleep 1");
+  // Give windows time to appear. gnome-terminal uses D-Bus so the window may
+  // take longer to materialise than the gnome-terminal command itself.
+  run("sleep 1.5");
 
   const winW = WIN_COLS * CHAR_W + WIN_PADDING_W;
   const winH = WIN_ROWS * CHAR_H + WIN_PADDING_H;
@@ -149,12 +183,27 @@ function rearrangeWindows(sessions) {
 
     if (hasWmctrl) {
       // -e gravity,x,y,w,h  (gravity 0 = default)
-      run(`wmctrl -r "${title}" -e 0,${x},${y},${winW},${winH} 2>/dev/null`);
+      // Retry once after a short delay if the window isn't found yet.
+      let result = run(`wmctrl -r "${title}" -e 0,${x},${y},${winW},${winH} 2>&1`);
+      if (result.includes("Cannot find")) {
+        run("sleep 1");
+        run(`wmctrl -r "${title}" -e 0,${x},${y},${winW},${winH} 2>/dev/null`);
+      }
     } else {
-      // xdotool: search by name, then move
-      run(
-        `xdotool search --name "${title}" windowmove ${x} ${y} 2>/dev/null`
-      );
+      // xdotool: search by name, then move + resize
+      const wid = run(`xdotool search --name "${title}" 2>/dev/null | head -1`);
+      if (wid) {
+        run(`xdotool windowsize ${wid} ${winW} ${winH} 2>/dev/null`);
+        run(`xdotool windowmove ${wid} ${x} ${y} 2>/dev/null`);
+      } else {
+        // Retry once
+        run("sleep 1");
+        const wid2 = run(`xdotool search --name "${title}" 2>/dev/null | head -1`);
+        if (wid2) {
+          run(`xdotool windowsize ${wid2} ${winW} ${winH} 2>/dev/null`);
+          run(`xdotool windowmove ${wid2} ${x} ${y} 2>/dev/null`);
+        }
+      }
     }
   }
 }
@@ -163,4 +212,4 @@ function convertWorkDir(dir) {
   return dir; // no conversion needed on Linux
 }
 
-module.exports = { openTerminalWindow, rearrangeWindows, convertWorkDir };
+module.exports = { openTerminalWindow, rearrangeWindows, closeAllWindows, convertWorkDir };
