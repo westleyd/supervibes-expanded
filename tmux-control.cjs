@@ -16,7 +16,7 @@ const { execSync } = require("child_process");
 
 const { detectPlatform } = require("./platform/detect.cjs");
 const PLATFORM = detectPlatform();
-const { openTerminalWindow, rearrangeWindows, convertWorkDir } =
+const { openTerminalWindow, rearrangeWindows, killTerminalWindows, convertWorkDir } =
   require(`./platform/${PLATFORM}.cjs`);
 
 // On Windows, tmux lives inside WSL; prefix every tmux call with `wsl`.
@@ -106,6 +106,7 @@ function stopAll() {
       ? `Stopped all sessions: ${sessions.join(", ")}`
       : "No active sessions."
   );
+  if (typeof killTerminalWindows === "function") killTerminalWindows();
 }
 
 function sendKeys(name, text) {
