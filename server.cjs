@@ -3,6 +3,7 @@
 
 const http = require("http");
 const fs = require("fs");
+const os = require("os");
 const path = require("path");
 const readline = require("readline");
 const { execSync, spawn } = require("child_process");
@@ -143,14 +144,22 @@ const state = {
   goal: "",
   terminalCount: "auto",
   model: "sonnet",
-  workerModel: "haiku",   // model used by worker agents (can differ from controller)
-  githubRepo: "",         // raw GitHub input from UI (owner/repo or full URL)
-  workDir: "",            // resolved absolute path used as agent working directory
-  iterations: 0,          // total iterations requested
-  currentIteration: 0,    // 0 = initial build, 1+ = improvement iterations
+  workerModel: "haiku",
+  githubRepo: "",
+  workDir: "",
+  iterations: 0,
+  currentIteration: 0,
   sessions: [],
   sseClients: [],
   pollInterval: null,
+  stopped: false,
+  // Log file
+  logFilePath: null,
+  logStream: null,
+  // Rate limit recovery
+  rateLimitDetected: false,
+  rateLimitResetTime: null,   // Date object
+  rateLimitTimer: null,
 };
 
 // --- Helpers ---
@@ -164,6 +173,7 @@ function pushControllerLine(line) {
   if (state.controllerOutput.length > MAX_BUFFER_LINES) {
     state.controllerOutput.shift();
   }
+  writeLog(line);
 }
 
 function broadcast(event, data) {
@@ -188,6 +198,218 @@ function runTmux(...args) {
   }
 }
 
+// --- Log file helpers ---
+
+function resolveLogDir(workDir) {
+  // Try 1: user-specified workDir
+  if (workDir) {
+    const resolved = path.resolve(workDir);
+    try {
+      fs.accessSync(resolved, fs.constants.W_OK);
+      return resolved;
+    } catch (_) {}
+  }
+  // Try 2: server's own directory (__dirname)
+  try {
+    fs.accessSync(__dirname, fs.constants.W_OK);
+    return __dirname;
+  } catch (_) {}
+  // Try 3: user's home directory
+  return os.homedir();
+}
+
+function openLog(workDir, goal, githubRepo, terminalCount, model, workerModel, iterations) {
+  // Close any existing log first
+  closeLog();
+
+  const logDir = resolveLogDir(workDir);
+  const now = new Date();
+  const year  = now.getFullYear();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day   = String(now.getDate()).padStart(2, "0");
+  const hh    = String(now.getHours()).padStart(2, "0");
+  const mm    = String(now.getMinutes()).padStart(2, "0");
+  const ss    = String(now.getSeconds()).padStart(2, "0");
+  const filename = `supervibes_${year}${month}${day}-${hh}${mm}${ss}.log`;
+  const logPath = path.join(logDir, filename);
+
+  try {
+    const stream = fs.createWriteStream(logPath, { flags: "w", encoding: "utf-8" });
+    state.logFilePath = logPath;
+    state.logStream = stream;
+
+    const workerParams = JSON.stringify({
+      terminals: terminalCount,
+      models: { controller: model, worker: workerModel },
+      iterations,
+    });
+
+    const header = [
+      `supervibes run log — ${now.toISOString()}`,
+      `prompt=${goal}`,
+      `GitHub url=${githubRepo || ""}`,
+      `path=${workDir || ""}`,
+      `worker parameters=${workerParams}`,
+      "=".repeat(60),
+      "",
+    ].join("\n");
+
+    stream.write(header);
+    return logPath;
+  } catch (err) {
+    console.warn("[supervibes] Failed to open log file:", err.message);
+    state.logFilePath = null;
+    state.logStream = null;
+    return null;
+  }
+}
+
+function writeLog(line) {
+  if (state.logStream) {
+    try {
+      state.logStream.write(line + "\n");
+    } catch (_) {}
+  }
+}
+
+function closeLog() {
+  if (state.logStream) {
+    try { state.logStream.end(); } catch (_) {}
+    state.logStream = null;
+  }
+}
+
+// --- Rate limit helpers ---
+
+/**
+ * Parse a reset time string like "resets 5am (America/Chicago)" into a Date.
+ * Returns a Date in the future, or null if unparseable.
+ */
+function parseResetTime(message) {
+  const m = /resets\s+(\d{1,2})(?::(\d{2}))?([ap]m)\s*\(([^)]+)\)/i.exec(message);
+  if (!m) return null;
+
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2] || "0", 10);
+  const ampm = m[3].toLowerCase();
+  const tz = m[4];
+
+  if (ampm === "pm" && h !== 12) h += 12;
+  if (ampm === "am" && h === 12) h = 0;
+
+  const now = new Date();
+
+  for (let dayOffset = 0; dayOffset <= 1; dayOffset++) {
+    const checkDate = new Date(now.getTime() + dayOffset * 86400000);
+
+    // Get the Y/M/D in the target timezone
+    const parts = new Intl.DateTimeFormat("en-US", {
+      timeZone: tz,
+      year: "numeric", month: "2-digit", day: "2-digit",
+    }).formatToParts(checkDate);
+    const p = {};
+    for (const part of parts) p[part.type] = part.value;
+
+    // Build a naive UTC estimate (pretend the wall-clock time is UTC)
+    const naiveISO = `${p.year}-${p.month}-${p.day}T${String(h).padStart(2,"0")}:${String(min).padStart(2,"0")}:00.000Z`;
+    const estimate = new Date(naiveISO);
+
+    // Find what hour this UTC maps to in the target timezone
+    const tzHour = parseInt(new Intl.DateTimeFormat("en-US", {
+      timeZone: tz, hour: "2-digit", hour12: false,
+    }).format(estimate), 10);
+
+    // Shift estimate so the target timezone shows the desired hour
+    const diff = (h - tzHour + 24) % 24;
+    const adjusted = new Date(estimate.getTime() + diff * 3600000);
+
+    if (adjusted > now) return adjusted;
+  }
+
+  return null;
+}
+
+function detectRateLimit(text) {
+  if (state.rateLimitDetected) return;
+  const resetTime = parseResetTime(text);
+  if (!resetTime) return;
+
+  state.rateLimitDetected = true;
+  state.rateLimitResetTime = resetTime;
+
+  const resumeTime = new Date(resetTime.getTime() + 20000);
+  const msg = `[Rate limit detected — session resets at ${resetTime.toLocaleString()} — will auto-resume ~20s after]`;
+  pushControllerLine(msg);
+  broadcast("controller", { line: msg });
+
+  // Broadcast timer state to all clients immediately
+  broadcast("ratelimit", {
+    active: true,
+    resetTime: resetTime.toISOString(),
+    resumeTime: resumeTime.toISOString(),
+  });
+}
+
+function startRateLimitTimer() {
+  if (!state.rateLimitResetTime || state.rateLimitTimer) return;
+
+  const resumeTime = new Date(state.rateLimitResetTime.getTime() + 20000);
+  const delayMs = Math.max(resumeTime.getTime() - Date.now(), 5000);
+
+  const timerMsg = `[Rate limit timer started — will resume at ${resumeTime.toLocaleString()}]`;
+  pushControllerLine(timerMsg);
+  broadcast("controller", { line: timerMsg });
+
+  state.rateLimitTimer = setTimeout(() => {
+    state.rateLimitTimer = null;
+
+    const resumeMsg = "[Rate limit reset — spawning new orchestrator to continue work...]";
+    pushControllerLine(resumeMsg);
+    broadcast("controller", { line: resumeMsg });
+    broadcast("ratelimit", { active: false });
+
+    // Spawn new controller in continuation mode
+    state.rateLimitDetected = false;
+    state.rateLimitResetTime = null;
+    spawnController(
+      state.goal,
+      state.terminalCount,
+      state.model,
+      state.currentIteration,
+      state.workerModel,
+      state.workDir,
+      true // continuationMode
+    );
+  }, delayMs);
+}
+
+function cancelRateLimitTimer() {
+  if (state.rateLimitTimer) {
+    clearTimeout(state.rateLimitTimer);
+    state.rateLimitTimer = null;
+  }
+  state.rateLimitDetected = false;
+  state.rateLimitResetTime = null;
+
+  broadcast("ratelimit", { active: false });
+
+  // Stop workers and clean up
+  try { runTmux("--stop-all"); } catch (_) {}
+  stopPolling();
+  state.running = false;
+  state.sessions = [];
+
+  const msg = "[Rate limit timer cancelled — work ended by user]";
+  pushControllerLine(msg);
+  broadcast("controller", { line: msg });
+  broadcast("status", { running: false });
+  broadcast("terminals", { sessions: [] });
+
+  closeLog();
+}
+
+// --- Terminal polling ---
+
 function pollTerminals() {
   try {
     const listOutput = runTmux("--list");
@@ -202,15 +424,26 @@ function pollTerminals() {
       }
     }
     state.sessions = sessions;
-
     broadcast("terminals", { sessions });
+
+    // Scan pane content for rate limit messages
+    if (!state.rateLimitDetected && sessions.length > 0) {
+      for (const name of sessions) {
+        try {
+          const paneContent = runTmux("--read", name);
+          if (paneContent && /you'?ve hit your (rate )?limit/i.test(paneContent)) {
+            detectRateLimit(paneContent);
+            break;
+          }
+        } catch (_) {}
+      }
+    }
   } catch (_) {}
 }
 
 function startPolling() {
   if (state.pollInterval) return;
   state.pollInterval = setInterval(pollTerminals, POLL_INTERVAL_MS);
-  // Do an immediate poll
   pollTerminals();
 }
 
@@ -223,19 +456,12 @@ function stopPolling() {
 
 // --- Git clone helper ---
 
-/**
- * Clones or updates a GitHub repository into a local workspaces/ directory.
- * @param {string} repoInput - "owner/repo" shorthand or full https/ssh URL
- * @param {string|undefined} targetDir - optional override for clone destination
- * @returns {string} resolved absolute path to the repo directory
- */
 function cloneOrPullRepo(repoInput, targetDir) {
   let repoUrl = repoInput.trim();
   if (!repoUrl.startsWith("https://") && !repoUrl.startsWith("git@")) {
     repoUrl = `https://github.com/${repoUrl}`;
   }
 
-  // Derive a filesystem-safe slug from the URL path: "owner/repo" → "owner-repo"
   const urlObj = new URL(repoUrl);
   const slug = urlObj.pathname
     .replace(/^\//, "")
@@ -246,7 +472,6 @@ function cloneOrPullRepo(repoInput, targetDir) {
     ? path.resolve(targetDir)
     : path.join(__dirname, "workspaces", slug);
 
-  // Ensure parent directory exists
   fs.mkdirSync(path.dirname(resolvedDir), { recursive: true });
 
   if (fs.existsSync(path.join(resolvedDir, ".git"))) {
@@ -266,7 +491,7 @@ function cloneOrPullRepo(repoInput, targetDir) {
 
 // --- Controller process ---
 
-function buildPrompt(goal, terminalCount, model, iteration, workerModel, workDir) {
+function buildPrompt(goal, terminalCount, model, iteration, workerModel, workDir, continuationMode) {
   let terminalInstruction = "";
   if (terminalCount === "auto") {
     terminalInstruction = "Decide how many terminals to use based on the goal. If possible, operate in parallel to improve dev speed.";
@@ -282,7 +507,19 @@ function buildPrompt(goal, terminalCount, model, iteration, workerModel, workDir
     : "";
 
   let goalSection = "";
-  if (iteration === 0) {
+  if (continuationMode) {
+    goalSection = `## Rate Limit Recovery — Continue Previous Session
+
+Your previous orchestration session was interrupted because Claude hit its API usage limits. The terminal workers may still be running in tmux sessions.
+
+Your job now:
+1. Use --list to check which terminals are still active
+2. For each active terminal that was still working, send: "Continue the work you were doing when session limits were hit"
+3. For terminals that are no longer active but were part of the original task, restart them and re-send their task
+4. Continue coordinating until the original goal is complete
+
+Original goal for context: ${goal}`;
+  } else if (iteration === 0) {
     goalSection = `## Your Goal\n\n${goal}`;
   } else {
     goalSection = `## Iteration ${iteration} — Improvement Round
@@ -300,8 +537,8 @@ Original goal for context: ${goal}`;
   return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}${workDirInstruction}\n\n${goalSection}`;
 }
 
-function spawnController(goal, terminalCount, model, iteration, workerModel, workDir) {
-  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel, workDir);
+function spawnController(goal, terminalCount, model, iteration, workerModel, workDir, continuationMode) {
+  const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel, workDir, continuationMode || false);
 
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
@@ -330,6 +567,19 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
 
   broadcast("status", { running: true, goal, terminalCount });
 
+  // Emit log file path as first line so UI and log both show it
+  if (state.logFilePath) {
+    const logLine = `[Log: ${state.logFilePath}]`;
+    pushControllerLine(logLine);
+    broadcast("controller", { line: logLine });
+  }
+
+  if (continuationMode) {
+    const contLine = "[Continuation mode — resuming after rate limit reset]";
+    pushControllerLine(contLine);
+    broadcast("controller", { line: contLine });
+  }
+
   let lineBuf = "";
 
   const processJsonLine = (raw) => {
@@ -338,9 +588,7 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       const msg = JSON.parse(raw);
       let line = null;
 
-      // stream-json message types we care about:
       if (msg.type === "assistant" && msg.message) {
-        // Assistant text/tool_use blocks
         const content = msg.message.content || [];
         for (const block of content) {
           if (block.type === "text" && block.text) {
@@ -354,31 +602,31 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
             }
           }
           if (line) {
-            // Split multi-line text into individual lines
             for (const l of line.split("\n")) {
               pushControllerLine(l);
               broadcast("controller", { line: l });
+              checkForRateLimit(l);
             }
             line = null;
           }
         }
       } else if (msg.type === "result" && msg.result) {
-        // Final result text
         const text = typeof msg.result === "string" ? msg.result : (msg.result.text || "");
         if (text) {
           for (const l of text.split("\n")) {
             pushControllerLine(l);
             broadcast("controller", { line: l });
+            checkForRateLimit(l);
           }
         }
       } else if (msg.type === "content_block_delta" && msg.delta) {
-        // Streaming text delta
         const text = msg.delta.text || "";
         if (text) {
           for (const l of text.split("\n")) {
             if (l) {
               pushControllerLine(l);
               broadcast("controller", { line: l });
+              checkForRateLimit(l);
             }
           }
         }
@@ -387,6 +635,14 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       // Not valid JSON, emit raw
       pushControllerLine(raw);
       broadcast("controller", { line: raw });
+      checkForRateLimit(raw);
+    }
+  };
+
+  const checkForRateLimit = (text) => {
+    if (!state.rateLimitDetected &&
+        (/you'?ve hit your (rate )?limit/i.test(text) || /resets\s+\d+[:\d]*[ap]m\s*\(/i.test(text))) {
+      detectRateLimit(text);
     }
   };
 
@@ -405,6 +661,7 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       if (line.trim()) {
         pushControllerLine(line);
         broadcast("controller", { line });
+        checkForRateLimit(line);
       }
     }
   };
@@ -421,7 +678,17 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     state.controllerProcess = null;
     stopPolling();
 
-    // Cleanup tmux sessions
+    // If rate limit was detected, don't stop workers — start the resume timer
+    if (state.rateLimitDetected && !state.stopped) {
+      const exitLine = `[Controller exited with code ${code} — rate limit recovery timer started]`;
+      pushControllerLine(exitLine);
+      broadcast("controller", { line: exitLine });
+      // Keep workers alive; start timer to resume
+      startRateLimitTimer();
+      return;
+    }
+
+    // Normal exit: clean up tmux sessions
     try { runTmux("--stop-all"); } catch (_) {}
     state.sessions = [];
     broadcast("terminals", { sessions: [] });
@@ -434,7 +701,6 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       broadcast("controller", { line: iterMsg });
       broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
 
-      // Small delay before next iteration
       setTimeout(() => {
         spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
       }, 2000);
@@ -449,6 +715,7 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       }
       broadcast("status", { running: false });
       state.stopped = false;
+      closeLog();
     }
   });
 
@@ -457,9 +724,18 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
 
 function stopController() {
   state.stopped = true;
+
+  // Cancel any pending rate limit timer
+  if (state.rateLimitTimer) {
+    clearTimeout(state.rateLimitTimer);
+    state.rateLimitTimer = null;
+    broadcast("ratelimit", { active: false });
+  }
+  state.rateLimitDetected = false;
+  state.rateLimitResetTime = null;
+
   if (state.controllerProcess) {
     state.controllerProcess.kill("SIGTERM");
-    // Give it a moment, then force kill
     setTimeout(() => {
       if (state.controllerProcess) {
         try { state.controllerProcess.kill("SIGKILL"); } catch (_) {}
@@ -473,6 +749,8 @@ function stopController() {
 
   broadcast("status", { running: false });
   broadcast("terminals", { sessions: [] });
+
+  closeLog();
 }
 
 // --- HTTP Server ---
@@ -511,7 +789,7 @@ const server = http.createServer(async (req, res) => {
   // --- API Routes ---
 
   if (pathname === "/api/start" && req.method === "POST") {
-    if (state.running) {
+    if (state.running || state.rateLimitTimer) {
       return sendJson(res, 400, { error: "Already running" });
     }
     const body = await parseBody(req);
@@ -542,12 +820,23 @@ const server = http.createServer(async (req, res) => {
     state.stopped = false;
     state.githubRepo = githubRepo;
 
+    // Open log file for this run
+    const logPath = openLog(workDir || "", goal, githubRepo, terminalCount, model, workerModel, iterations);
+
     spawnController(goal, terminalCount, model, 0, workerModel, workDir);
-    return sendJson(res, 200, { ok: true, workDir });
+    return sendJson(res, 200, { ok: true, workDir, logPath });
   }
 
   if (pathname === "/api/stop" && req.method === "POST") {
     stopController();
+    return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/cancel-timer" && req.method === "POST") {
+    if (!state.rateLimitTimer && !state.rateLimitDetected) {
+      return sendJson(res, 400, { error: "No active rate limit timer" });
+    }
+    cancelRateLimitTimer();
     return sendJson(res, 200, { ok: true });
   }
 
@@ -573,6 +862,9 @@ const server = http.createServer(async (req, res) => {
       iterations: state.iterations,
       currentIteration: state.currentIteration,
       sessions: state.sessions,
+      logFilePath: state.logFilePath,
+      rateLimitActive: !!state.rateLimitTimer,
+      rateLimitResetTime: state.rateLimitResetTime ? state.rateLimitResetTime.toISOString() : null,
     });
   }
 
@@ -585,7 +877,10 @@ const server = http.createServer(async (req, res) => {
 
     state.sseClients.push(res);
 
-    // Send init event with current state
+    const resumeTime = state.rateLimitResetTime
+      ? new Date(state.rateLimitResetTime.getTime() + 20000).toISOString()
+      : null;
+
     const initData = {
       running: state.running,
       goal: state.goal,
@@ -598,6 +893,10 @@ const server = http.createServer(async (req, res) => {
       currentIteration: state.currentIteration,
       controllerOutput: state.controllerOutput,
       sessions: state.sessions,
+      logFilePath: state.logFilePath,
+      rateLimitActive: !!state.rateLimitTimer,
+      rateLimitResetTime: state.rateLimitResetTime ? state.rateLimitResetTime.toISOString() : null,
+      rateLimitResumeTime: resumeTime,
     };
     res.write(`event: init\ndata: ${JSON.stringify(initData)}\n\n`);
 
@@ -613,7 +912,6 @@ const server = http.createServer(async (req, res) => {
   let filePath = pathname === "/" ? "/index.html" : pathname;
   filePath = path.join(PUBLIC_DIR, filePath);
 
-  // Prevent directory traversal
   if (!filePath.startsWith(PUBLIC_DIR)) {
     res.writeHead(403);
     return res.end("Forbidden");

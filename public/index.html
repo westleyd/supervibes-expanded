@@ -202,6 +202,42 @@
   .log-entry.type-exit .log-icon { color: #ff7b72; }
   .log-entry.type-exit .log-msg { color: #fff; }
 
+  .log-entry.type-logpath .log-icon { color: #8b949e; }
+  .log-entry.type-logpath .log-msg { color: #8b949e; font-size: 12px; }
+  .log-entry.type-logpath .log-msg .log-detail { font-size: 11px; color: #666; }
+
+  /* --- Rate limit timer card --- */
+  .ratelimit-card {
+    margin: 10px 16px 4px;
+    background: #1c1a0e;
+    border: 1px solid #6e5a00;
+    border-radius: 6px;
+    padding: 10px 14px;
+    font-size: 13px;
+  }
+  .ratelimit-card .rl-title {
+    color: #e3b341;
+    font-weight: 600;
+    margin-bottom: 4px;
+  }
+  .ratelimit-card .rl-countdown {
+    color: #ccc;
+    font-family: "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    margin-bottom: 8px;
+  }
+  .ratelimit-card .rl-cancel {
+    padding: 5px 10px;
+    background: #6e1a1a;
+    border: 1px solid #da3633;
+    border-radius: 4px;
+    color: #ff7b72;
+    font-size: 12px;
+    cursor: pointer;
+    width: 100%;
+  }
+  .ratelimit-card .rl-cancel:hover { background: #8a2020; }
+
   /* --- Terminals Sidebar --- */
   .panel-terminals {
     width: 300px;
@@ -379,6 +415,11 @@
   </div>
   <div class="panel-terminals">
     <div class="panel-header">Terminals</div>
+    <div id="rateLimitCard" class="ratelimit-card" style="display:none;">
+      <div class="rl-title">Rate limit hit — auto-resume pending</div>
+      <div class="rl-countdown" id="rlCountdown">Calculating...</div>
+      <button class="rl-cancel" onclick="doCancelTimer()">Cancel timer and end work now</button>
+    </div>
     <div class="terminals-list" id="terminalsList">
       <div class="empty-state" id="terminalsEmpty">None</div>
     </div>
@@ -425,6 +466,9 @@
   let terminalPrompts = {};
   let expandedTerminals = {};
   let lastSessions = [];
+  // Rate limit timer state
+  let rateLimitResumeTime = null;
+  let rateLimitCountdownInterval = null;
 
   // --- Parsing ---
 
@@ -444,6 +488,14 @@
   }
 
   function parseLine(line) {
+    // Log file path
+    if (/^\[Log:\s/.test(line)) return { type: "logpath", icon: "#", msg: "Log file", detail: line.replace(/^\[Log:\s*/, "").replace(/\]$/, "") };
+
+    // Rate limit / recovery info lines
+    if (/^\[Rate limit|^\[Controller exited.*rate limit|^\[Waiting for rate limit|^\[Rate limit timer|^\[Continuation mode|^\[Rate limit reset/.test(line)) {
+      return { type: "info", icon: "!", msg: line.trim() };
+    }
+
     // --start
     let m = startRegex.exec(line);
     if (m) return { type: "start", icon: "+", msg: "Started terminal", detail: m[1], dir: m[2] };
@@ -666,6 +718,13 @@
       if (data.githubRepo) githubRepoInput.value = data.githubRepo;
       if (data.workDir)    workDirInput.value    = data.workDir;
 
+      // Restore rate limit timer if active
+      if (data.rateLimitActive && data.rateLimitResumeTime) {
+        startRateLimitCountdown(data.rateLimitResumeTime);
+      } else {
+        stopRateLimitCountdown();
+      }
+
       // Re-parse all buffered lines into log entries
       controllerLines = data.controllerOutput || [];
       logEntries = [];
@@ -676,6 +735,15 @@
       }
       renderLog();
       renderTerminals(data.sessions);
+    });
+
+    eventSource.addEventListener("ratelimit", function(e) {
+      const data = JSON.parse(e.data);
+      if (data.active && data.resumeTime) {
+        startRateLimitCountdown(data.resumeTime);
+      } else {
+        stopRateLimitCountdown();
+      }
     });
 
     eventSource.addEventListener("controller", function(e) {
@@ -728,6 +796,7 @@
     terminalPrompts = {};
     expandedTerminals = {};
     logBody.innerHTML = "";
+    stopRateLimitCountdown();
     renderTerminals([]);
 
     try {
@@ -748,6 +817,47 @@
   window.doStop = async function() {
     try { await fetch("/api/stop", { method: "POST" }); } catch (_) {}
   };
+
+  window.doCancelTimer = async function() {
+    try { await fetch("/api/cancel-timer", { method: "POST" }); } catch (_) {}
+  };
+
+  function fmtDuration(ms) {
+    if (ms <= 0) return "any moment now...";
+    const totalSec = Math.ceil(ms / 1000);
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    if (h > 0) return `${h}h ${m}m ${s}s`;
+    if (m > 0) return `${m}m ${s}s`;
+    return `${s}s`;
+  }
+
+  function startRateLimitCountdown(resumeTime) {
+    rateLimitResumeTime = resumeTime ? new Date(resumeTime) : null;
+    stopRateLimitCountdown();
+    const card = document.getElementById("rateLimitCard");
+    const countdown = document.getElementById("rlCountdown");
+    if (!rateLimitResumeTime) { card.style.display = "none"; return; }
+
+    card.style.display = "";
+    function tick() {
+      const remaining = rateLimitResumeTime - Date.now();
+      countdown.textContent = "Resuming in: " + fmtDuration(remaining) +
+        " (at " + rateLimitResumeTime.toLocaleTimeString() + ")";
+    }
+    tick();
+    rateLimitCountdownInterval = setInterval(tick, 1000);
+  }
+
+  function stopRateLimitCountdown() {
+    if (rateLimitCountdownInterval) {
+      clearInterval(rateLimitCountdownInterval);
+      rateLimitCountdownInterval = null;
+    }
+    rateLimitResumeTime = null;
+    document.getElementById("rateLimitCard").style.display = "none";
+  }
 
   window.doShutdown = async function() {
     if (!confirm("Shutdown the server? This stops all agents and exits the Node.js process.")) return;
