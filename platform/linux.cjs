@@ -4,40 +4,24 @@
 /**
  * Linux platform adapter for supervibes.
  *
- * Terminal emulator:
- *   X11  — gnome-terminal → konsole → xfce4-terminal → xterm
- *   Wayland — xterm (preferred) → gnome-terminal → konsole → xfce4-terminal
+ * xterm is always preferred — it has no D-Bus factory model, so it works
+ * whether the server is launched from a GUI session or over SSH (where
+ * WAYLAND_DISPLAY may be unset). GTK/Qt terminals use a D-Bus daemon that
+ * creates Wayland-native windows invisible to wmctrl — kept as fallbacks only.
  *
- *   On Wayland, gnome-terminal/konsole/xfce4-terminal use a D-Bus factory model:
- *   new windows are created by a server daemon that ignores GDK_BACKEND=x11 on
- *   the client side. xterm has no factory model and is always X11/XWayland-native,
- *   so wmctrl can see and position its windows correctly.
- *
- * Window positioning: wmctrl (preferred) → xdotool (fallback) → graceful skip
+ * Window positioning: wmctrl + xdotool (both used; Mutter needs a second pass)
  *
  * Prerequisites (Ubuntu/Debian):
- *   sudo apt install tmux wmctrl
- *   # For Wayland grid positioning:
- *   sudo apt install xterm
- *   # Optional for xdotool fallback:
- *   sudo apt install xdotool
+ *   sudo apt install tmux wmctrl xdotool xterm
  */
 
-const { execSync } = require("child_process");
+const { execSync, spawn: nodeSpawn } = require("child_process");
 
 const PREFIX = "cc-";
-const WIN_COLS = 53;
-const WIN_ROWS = 22;
 const GRID_ROWS = 2;
-const WIN_GAP = 10;
-const GRID_ORIGIN_X = 40;
-const GRID_ORIGIN_Y = 40;
-
-// Rough pixel estimates per character for window sizing
-const CHAR_W = 8;
-const CHAR_H = 18;
-const WIN_PADDING_W = 20;
-const WIN_PADDING_H = 50;
+const WIN_GAP = 6;
+const GRID_ORIGIN_X = 20;
+const GRID_ORIGIN_Y = 20;
 
 function isWayland() {
   return !!process.env.WAYLAND_DISPLAY;
@@ -60,12 +44,34 @@ function which(cmd) {
   }
 }
 
+function getScreenSize() {
+  const d = run("xdpyinfo 2>/dev/null | grep dimensions");
+  if (d) {
+    const m = d.match(/(\d+)x(\d+)\s+pixels/);
+    if (m) return { width: +m[1], height: +m[2] };
+  }
+  const x = run("xrandr 2>/dev/null | grep '\\*'");
+  if (x) {
+    const m = x.match(/(\d+)x(\d+)/);
+    if (m) return { width: +m[1], height: +m[2] };
+  }
+  return { width: 1920, height: 1080 };
+}
+
+function computeGrid(sessionCount) {
+  const screen = getScreenSize();
+  const rows = Math.min(GRID_ROWS, sessionCount);
+  const cols = Math.ceil(sessionCount / rows);
+  const availW = screen.width - GRID_ORIGIN_X * 2 - (cols - 1) * WIN_GAP;
+  const availH = screen.height - GRID_ORIGIN_Y * 2 - (rows - 1) * WIN_GAP;
+  const winW = Math.max(200, Math.floor(availW / cols));
+  const winH = Math.max(150, Math.floor(availH / rows));
+  return { rows, cols, winW, winH };
+}
+
 function detectTerminalEmulator() {
-  // xterm is always preferred: it has no D-Bus factory model, so it works correctly
-  // whether the server is launched from a GUI session or over SSH (where WAYLAND_DISPLAY
-  // is unset). GTK/Qt terminals (gnome-terminal, konsole, xfce4-terminal) use a D-Bus
-  // factory daemon that ignores GDK_BACKEND=x11 and creates Wayland-native windows
-  // invisible to wmctrl — kept here only as fallbacks.
+  // xterm is always preferred: no D-Bus factory model, works reliably from both
+  // GUI sessions and SSH. GTK/Qt terminals kept only as fallbacks.
   const order = ["xterm", "gnome-terminal", "konsole", "xfce4-terminal"];
   for (const term of order) {
     if (which(term)) return term;
@@ -74,26 +80,20 @@ function detectTerminalEmulator() {
 }
 
 function buildTerminalCmd(term, sess) {
-  const attach =
-    `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null; tmux attach -t ${sess}`;
-  // GDK_BACKEND=x11 / QT_QPA_PLATFORM=xcb help only when the terminal's D-Bus
-  // server daemon is not already running; if it is, the daemon ignores these vars.
-  // On Wayland, detectTerminalEmulator() prefers xterm which has no factory model.
-  // These prefixes are kept here as a best-effort fallback for edge cases.
-  const gtkX11  = isWayland() ? "GDK_BACKEND=x11 " : "";
-  const qtX11   = isWayland() ? "QT_QPA_PLATFORM=xcb " : "";
-
+  const attach = `unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT 2>/dev/null; tmux attach -t ${sess}`;
+  // GDK_BACKEND/QT hints are best-effort for edge cases where the D-Bus daemon
+  // isn't already running. xterm needs no prefix — it is always X11-native.
+  const gtkX11 = isWayland() ? "GDK_BACKEND=x11 " : "";
+  const qtX11  = isWayland() ? "QT_QPA_PLATFORM=xcb " : "";
   switch (term) {
     case "gnome-terminal":
       return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}'`;
     case "konsole":
       return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}'`;
     case "xfce4-terminal":
-      // xfce4-terminal -e takes a single string
       return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}'"`;
     case "xterm":
     default:
-      // xterm is always X11-native — no prefix needed
       return `xterm -title "${sess}" -e bash -c '${attach}'`;
   }
 }
@@ -101,60 +101,73 @@ function buildTerminalCmd(term, sess) {
 function openTerminalWindow(sess) {
   const term = detectTerminalEmulator();
   if (!term) {
-    const waylandHint = isWayland()
-      ? "\n  On Wayland, xterm is required for grid positioning: sudo apt install xterm"
-      : "";
     console.warn(
       "[supervibes] No supported terminal emulator found.\n" +
-      "  Install one: sudo apt install gnome-terminal  (or xterm, konsole, xfce4-terminal)" +
-      waylandHint
+      "  Install one: sudo apt install xterm"
     );
     return;
   }
   const cmd = buildTerminalCmd(term, sess);
-  // Launch detached so Node.js doesn't wait for the window to close
-  execSync(`${cmd} &`, { timeout: 5000, shell: "/bin/bash" });
+  // Use spawn() with detached:true — multiple rapid execSync+& launches can be
+  // dropped on XWayland due to race conditions in the X11 socket.
+  const child = nodeSpawn("bash", ["-c", cmd], { detached: true, stdio: "ignore" });
+  child.unref();
+  // Brief pause between launches to let XWayland settle before the next window
+  run("sleep 0.5");
+}
+
+function killTerminalWindows() {
+  run(`pkill -f 'xterm.*${PREFIX}' 2>/dev/null`);
+  run(`pkill -f 'gnome-terminal.*${PREFIX}' 2>/dev/null`);
+  run(`pkill -f 'konsole.*${PREFIX}' 2>/dev/null`);
+  run(`pkill -f 'xfce4-terminal.*${PREFIX}' 2>/dev/null`);
 }
 
 function rearrangeWindows(sessions) {
   if (sessions.length === 0) return;
 
-  const hasWmctrl = which("wmctrl");
+  const hasWmctrl  = which("wmctrl");
   const hasXdotool = which("xdotool");
 
   if (!hasWmctrl && !hasXdotool) {
-    const waylandNote = isWayland()
-      ? "\n  On Wayland, also install xterm for X11-compatible windows: sudo apt install xterm"
-      : "";
     console.warn(
-      "[supervibes] Window positioning skipped — neither wmctrl nor xdotool found.\n" +
-      "  Install wmctrl: sudo apt install wmctrl" + waylandNote
+      "[supervibes] Window positioning skipped — install wmctrl or xdotool.\n" +
+      "  sudo apt install wmctrl xdotool"
     );
     return;
   }
 
-  // Give windows a moment to appear before we try to position them
+  // Give windows a moment to appear before positioning
   run("sleep 1");
 
-  const winW = WIN_COLS * CHAR_W + WIN_PADDING_W;
-  const winH = WIN_ROWS * CHAR_H + WIN_PADDING_H;
+  const { rows, winW, winH } = computeGrid(sessions.length);
 
-  for (let i = 0; i < sessions.length; i++) {
-    const col = Math.floor(i / GRID_ROWS);
-    const row = i % GRID_ROWS;
-    const x = GRID_ORIGIN_X + col * (winW + WIN_GAP);
-    const y = GRID_ORIGIN_Y + row * (winH + WIN_GAP);
-    const title = `${PREFIX}${sessions[i]}`;
+  function positionAll() {
+    for (let i = 0; i < sessions.length; i++) {
+      const col = Math.floor(i / rows);
+      const row = i % rows;
+      const x = GRID_ORIGIN_X + col * (winW + WIN_GAP);
+      const y = GRID_ORIGIN_Y + row * (winH + WIN_GAP);
+      const title = `${PREFIX}${sessions[i]}`;
 
-    if (hasWmctrl) {
-      // -e gravity,x,y,w,h  (gravity 0 = default)
-      run(`wmctrl -r "${title}" -e 0,${x},${y},${winW},${winH} 2>/dev/null`);
-    } else {
-      // xdotool: search by name, then move
-      run(
-        `xdotool search --name "${title}" windowmove ${x} ${y} 2>/dev/null`
-      );
+      if (hasWmctrl) {
+        // Remove maximized state first — Mutter ignores moves on maximized windows
+        run(`wmctrl -r "${title}" -b remove,maximized_vert,maximized_horz 2>/dev/null`);
+        run(`wmctrl -r "${title}" -e 0,${x},${y},${winW},${winH} 2>/dev/null`);
+        run(`wmctrl -r "${title}" -b remove,hidden 2>/dev/null`);
+      }
+      if (hasXdotool) {
+        run(`xdotool search --name "${title}" windowsize ${winW} ${winH} windowmove ${x} ${y} 2>/dev/null`);
+      }
     }
+  }
+
+  positionAll();
+
+  // Wayland/Mutter often ignores the first positioning attempt — second pass fixes it
+  if (isWayland() || !hasWmctrl) {
+    run("sleep 0.4");
+    positionAll();
   }
 }
 
@@ -162,4 +175,4 @@ function convertWorkDir(dir) {
   return dir; // no conversion needed on Linux
 }
 
-module.exports = { openTerminalWindow, rearrangeWindows, convertWorkDir };
+module.exports = { openTerminalWindow, rearrangeWindows, killTerminalWindows, convertWorkDir };
