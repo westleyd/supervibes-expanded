@@ -834,8 +834,8 @@
   }
 
   function startRateLimitCountdown(resumeTime) {
-    rateLimitResumeTime = resumeTime ? new Date(resumeTime) : null;
     stopRateLimitCountdown();
+    rateLimitResumeTime = resumeTime ? new Date(resumeTime) : null;
     const card = document.getElementById("rateLimitCard");
     const countdown = document.getElementById("rlCountdown");
     if (!rateLimitResumeTime) { card.style.display = "none"; return; }

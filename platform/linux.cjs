@@ -61,13 +61,12 @@ function which(cmd) {
 }
 
 function detectTerminalEmulator() {
-  // On Wayland, GTK/Qt terminals use a D-Bus factory model: the daemon that creates
-  // windows ignores GDK_BACKEND=x11 set on the client, so new windows remain
-  // Wayland-native and are invisible to wmctrl. xterm has no factory — it is always
-  // an XWayland window — so prefer it on Wayland for reliable grid positioning.
-  const order = isWayland()
-    ? ["xterm", "gnome-terminal", "konsole", "xfce4-terminal"]
-    : ["gnome-terminal", "konsole", "xfce4-terminal", "xterm"];
+  // xterm is always preferred: it has no D-Bus factory model, so it works correctly
+  // whether the server is launched from a GUI session or over SSH (where WAYLAND_DISPLAY
+  // is unset). GTK/Qt terminals (gnome-terminal, konsole, xfce4-terminal) use a D-Bus
+  // factory daemon that ignores GDK_BACKEND=x11 and creates Wayland-native windows
+  // invisible to wmctrl — kept here only as fallbacks.
+  const order = ["xterm", "gnome-terminal", "konsole", "xfce4-terminal"];
   for (const term of order) {
     if (which(term)) return term;
   }
@@ -86,12 +85,12 @@ function buildTerminalCmd(term, sess) {
 
   switch (term) {
     case "gnome-terminal":
-      return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}; exec bash'`;
+      return `${gtkX11}gnome-terminal --title="${sess}" -- bash -c '${attach}'`;
     case "konsole":
-      return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}; exec bash'`;
+      return `${qtX11}konsole --title "${sess}" -e bash -c '${attach}'`;
     case "xfce4-terminal":
       // xfce4-terminal -e takes a single string
-      return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}; exec bash'"`;
+      return `${gtkX11}xfce4-terminal --title="${sess}" -e "bash -c '${attach}'"`;
     case "xterm":
     default:
       // xterm is always X11-native — no prefix needed
