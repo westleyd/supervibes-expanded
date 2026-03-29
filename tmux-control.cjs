@@ -71,7 +71,8 @@ function startSession(name, workDir) {
       `-e "CLAUDECODE=" ` +
       `-e "CLAUDE_CODE_ENTRYPOINT=" ` +
       `-e "TERM=xterm-256color" ` +
-      `-e "PATH=${pathEnv}"`
+      `-e "PATH=${pathEnv}" ` +
+      `-e "NODE_OPTIONS=--max-old-space-size=450"`
   );
 
   // Unset at the tmux environment level too (prevents inheritance on attach).

@@ -47,7 +47,7 @@ node ${TMUX_CONTROL} --list
 ## Workflow
 
 1. Break the goal into small, focused sub-tasks — one per terminal
-2. Start ALL terminals at once with descriptive names (e.g. "ui", "api", "tests")
+2. Stagger terminal starts 12-15s apart to avoid OOM (do NOT launch all at once). Descriptive names e.g. "ui", "api", "tests"
 3. In each terminal, launch Claude Code: --cmd <name> "claude --dangerously-skip-permissions --model <MODEL>"
 4. Wait a few seconds, then send a blank Enter: --cmd <name> ""
 5. Send a SHORT, FOCUSED task to each terminal — one specific thing per terminal
@@ -88,14 +88,14 @@ Each terminal gets ONE file or ONE responsibility. Be precise about what it owns
 
 ## Parallel execution — USE MULTIPLE TERMINALS
 
-ALWAYS default to running multiple terminals in parallel. Speed is the priority. Start all terminals upfront and give each one its task immediately — do NOT wait for one to finish before starting the next.
+ALWAYS use multiple terminals in parallel. Stagger launches 12-15s apart — start a terminal, send its task, then start the next. Do NOT launch all simultaneously (causes OOM crashes on memory-constrained systems).
 
 There are NO conflicts as long as your instructions to each terminal are precise about what files and directories it owns. This is easy — just be explicit in every prompt.
 
 **How to split work:**
 - Give each terminal a distinct area (e.g. "ui" owns src/components/, "api" owns src/api/, "tests" only reads and runs tests)
 - In each prompt, state exactly: "You own <directory>. Do NOT create or edit files outside this directory."
-- Start ALL terminals at once and send their tasks immediately
+- Stagger terminal starts 12-15s apart; send each its task immediately after starting it
 - For dependent work, start both — have the dependent one scaffold its own area while waiting, then integrate once the dependency is ready
 
 **Simple rule:** If the task can be split into 2+ areas, split it and run in parallel. The only thing that matters is giving clear, non-overlapping ownership in each prompt.
@@ -132,7 +132,7 @@ You MUST verify that everything works before declaring the task done. NEVER hand
 - Wait a few seconds between starting a terminal and sending commands
 - Use descriptive session names that match the task purpose
 - DEFAULT to running multiple terminals in parallel — speed matters more than caution
-- Start ALL terminals at once and send tasks immediately, don't serialize unnecessarily
+- Stagger terminal starts 12-15s apart; send each its task immediately after starting it
 `;
 
 // --- State ---
