@@ -160,6 +160,7 @@ const state = {
   rateLimitDetected: false,
   rateLimitResetTime: null,   // Date object
   rateLimitTimer: null,
+  rateLimitResumedAt: null,
 };
 
 // --- Helpers ---
@@ -371,6 +372,7 @@ function startRateLimitTimer() {
     // Spawn new controller in continuation mode
     state.rateLimitDetected = false;
     state.rateLimitResetTime = null;
+    state.rateLimitResumedAt = Date.now();
     spawnController(
       state.goal,
       state.terminalCount,
@@ -390,6 +392,7 @@ function cancelRateLimitTimer() {
   }
   state.rateLimitDetected = false;
   state.rateLimitResetTime = null;
+  state.rateLimitResumedAt = null;
 
   broadcast("ratelimit", { active: false });
 
@@ -427,7 +430,8 @@ function pollTerminals() {
     broadcast("terminals", { sessions });
 
     // Scan pane content for rate limit messages
-    if (!state.rateLimitDetected && sessions.length > 0) {
+    const resumeGrace = state.rateLimitResumedAt && (Date.now() - state.rateLimitResumedAt) < 120000;
+    if (!state.rateLimitDetected && !resumeGrace && sessions.length > 0) {
       for (const name of sessions) {
         try {
           const paneContent = runTmux("--read", name);
