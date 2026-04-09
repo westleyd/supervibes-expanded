@@ -420,20 +420,8 @@ function doRateLimitResume(reason) {
   state.rateLimitResetTime = null;
   state.rateLimitResumedAt = Date.now();
 
-  // If the controller is still alive (it paused at the rate limit rather than
-  // exiting), just send "Continue" — no new process needed, full context preserved.
-  if (sendToController("Continue")) {
-    const resumeMsg = `[${reason} — sent Continue to live orchestrator]`;
-    pushControllerLine(resumeMsg);
-    broadcast("controller", { line: resumeMsg });
-    // Reset the watchdog so we don't immediately nudge
-    state.lastControllerOutputAt = Date.now();
-    state.watchdogNudges = 0;
-    return;
-  }
-
-  // Controller exited — spawn a new one in continuation mode
-  const resumeMsg = `[${reason} — orchestrator exited, spawning continuation]`;
+  // Controller exited (-p mode always exits) — spawn a new one in continuation mode
+  const resumeMsg = `[${reason} — spawning continuation orchestrator]`;
   pushControllerLine(resumeMsg);
   broadcast("controller", { line: resumeMsg });
   spawnController(
@@ -677,17 +665,15 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
 
-  // Run claude in interactive mode (no -p flag) with stdin open as a pipe.
-  // This lets us inject messages at any time and keeps context alive across
-  // rate-limit pauses and (if configured) multi-iteration runs.
   const child = spawn("claude", [
     "--dangerously-skip-permissions",
+    "-p", prompt,
     "--model", model || "sonnet",
     "--output-format", "stream-json",
     "--verbose",
   ], {
     cwd: __dirname,
-    stdio: ["pipe", "pipe", "pipe"],
+    stdio: ["ignore", "pipe", "pipe"],
     env,
   });
 
@@ -715,9 +701,6 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     pushControllerLine(contLine);
     broadcast("controller", { line: contLine });
   }
-
-  // Send the initial prompt via stdin (equivalent to the user typing it)
-  child.stdin.write(prompt + "\n");
 
   let lineBuf = "";
 
@@ -772,72 +755,13 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     }
   };
 
-  // When the controller signals it finished a phase, either start the next
-  // iteration (by writing the next prompt to stdin) or close stdin to let
-  // the session end naturally.
+  // Log when the orchestrator signals it has finished a phase.
+  // Iteration management is handled by the exit handler below (respawn per iteration).
   const checkForCompletion = (text) => {
     if (!text.includes(COMPLETION_MARKER)) return;
-    if (state.stopped) return;
-
-    if (state.currentIteration < state.iterations) {
-      state.currentIteration++;
-      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
-      pushControllerLine(iterMsg);
-      broadcast("controller", { line: iterMsg });
-      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
-
-      // Reset watchdog for the new phase
-      state.watchdogNudges = 0;
-      state.lastControllerOutputAt = Date.now();
-
-      // Compact the conversation history before the next iteration so the
-      // accumulated terminal reads and tool-call scaffolding don't balloon the
-      // context window. We give /compact ~10s to finish before sending the next
-      // prompt — compression is fast, but we want its result event to land first
-      // so the new prompt isn't included in what gets summarised.
-      const compactMsg = "[Sending /compact to reduce context before next iteration]";
-      pushControllerLine(compactMsg);
-      broadcast("controller", { line: compactMsg });
-
-      const compactSentAt = Date.now();
-      sendToController("/compact");
-
-      // Send the next iteration prompt as soon as /compact's output goes quiet
-      // (2s of silence after we see output from it). Fall back to 10s if the
-      // quiet window never clearly arrives — e.g. if the response is ambiguous.
-      let compactDone = false;
-      const sendNextIterationPrompt = (via) => {
-        if (compactDone || state.stopped || !state.controllerProcess) return;
-        compactDone = true;
-        clearInterval(compactWatcher);
-        clearTimeout(compactFallback);
-        const readyMsg = `[/compact finished (${via}) — starting iteration ${state.currentIteration}]`;
-        pushControllerLine(readyMsg);
-        broadcast("controller", { line: readyMsg });
-        const iterPrompt = buildIterationPrompt(state.currentIteration, state.goal);
-        sendToController(iterPrompt);
-      };
-
-      const compactWatcher = setInterval(() => {
-        if (state.stopped || !state.controllerProcess) { clearInterval(compactWatcher); return; }
-        // Only fire once output has actually arrived after the /compact was sent,
-        // then gone quiet for ≥2s — avoids triggering on pre-existing silence.
-        const sawOutputAfterSend = state.lastControllerOutputAt > compactSentAt;
-        const quietMs = Date.now() - state.lastControllerOutputAt;
-        if (sawOutputAfterSend && quietMs >= 2000) sendNextIterationPrompt("quiet detect");
-      }, 500);
-
-      const compactFallback = setTimeout(
-        () => sendNextIterationPrompt("10s fallback"),
-        10000
-      );
-    } else {
-      // All iterations done — close stdin so the session exits cleanly
-      const doneMsg = "[All tasks complete — closing orchestrator session]";
-      pushControllerLine(doneMsg);
-      broadcast("controller", { line: doneMsg });
-      try { child.stdin.end(); } catch (_) {}
-    }
+    const msg = "[Orchestrator signaled task complete]";
+    pushControllerLine(msg);
+    broadcast("controller", { line: msg });
   };
 
   const handleStdout = (chunk) => {
@@ -889,13 +813,26 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     state.sessions = [];
     broadcast("terminals", { sessions: [] });
 
+    // Start next iteration if configured
+    if (code === 0 && state.currentIteration < state.iterations && !state.stopped) {
+      state.currentIteration++;
+      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
+      pushControllerLine(iterMsg);
+      broadcast("controller", { line: iterMsg });
+      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
+      setTimeout(() => {
+        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
+      }, 2000);
+      return;
+    }
+
     state.running = false;
     const reason = state.stopped ? "Stopped by user" : `Controller exited (code ${code})`;
     pushControllerLine(`\n[${reason}]`);
     broadcast("controller", { line: `\n[${reason}]` });
-    if (state.iterations > 0 && !state.stopped) {
-      pushControllerLine(`[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]`);
-      broadcast("controller", { line: `[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]` });
+    if (state.iterations > 0 && code === 0 && !state.stopped) {
+      pushControllerLine(`[All ${state.iterations} iteration(s) complete]`);
+      broadcast("controller", { line: `[All ${state.iterations} iteration(s) complete]` });
     }
     broadcast("status", { running: false });
     state.stopped = false;
@@ -925,7 +862,6 @@ function stopController() {
   stopWatchdog();
 
   if (state.controllerProcess) {
-    try { state.controllerProcess.stdin.end(); } catch (_) {}
     state.controllerProcess.kill("SIGTERM");
     setTimeout(() => {
       if (state.controllerProcess) {
