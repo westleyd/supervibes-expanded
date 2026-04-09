@@ -331,6 +331,43 @@
     font-style: italic;
   }
 
+  /* --- Message box (visible while running) --- */
+  .controls-message {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .controls-message .msg-input {
+    flex: 1;
+    padding: 7px 12px;
+    background: #0d1117;
+    border: 1px solid #388bfd55;
+    border-radius: 6px;
+    color: #e6edf3;
+    font-size: 13px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    outline: none;
+  }
+  .controls-message .msg-input:focus { border-color: #58a6ff; }
+  .controls-message .msg-input::placeholder { color: #4a5568; }
+  .btn-send {
+    padding: 7px 14px;
+    border: none;
+    border-radius: 6px;
+    font-size: 13px;
+    font-weight: 500;
+    cursor: pointer;
+    background: #1f4e79;
+    color: #79c0ff;
+    white-space: nowrap;
+    transition: opacity 0.15s;
+  }
+  .btn-send:hover { opacity: 0.85; }
+  .btn-send:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .log-entry.type-usermsg .log-icon { color: #79c0ff; }
+  .log-entry.type-usermsg .log-msg  { color: #79c0ff; font-style: italic; }
+
   ::-webkit-scrollbar { width: 8px; }
   ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb { background: #30363d; border-radius: 4px; }
@@ -365,7 +402,7 @@
   </div>
 
   <!-- Row 3: Options + buttons -->
-  <div class="controls-options">
+  <div class="controls-options" id="optionsRow">
     <select id="terminalSelect">
       <option value="auto">Auto</option>
       <option value="1">1 Terminal</option>
@@ -397,6 +434,14 @@
     <button class="btn-stop"     id="btnStop"     onclick="doStop()"     disabled>Stop</button>
     <button class="btn-shutdown" id="btnShutdown" onclick="doShutdown()">Shutdown</button>
   </div>
+
+  <!-- Row 4: Message to orchestrator (only shown while running) -->
+  <div class="controls-message" id="msgRow" style="display:none;">
+    <input type="text" id="msgInput" class="msg-input"
+           placeholder="Message to orchestrator — queued and sent at next session boundary (Enter to send)" />
+    <button class="btn-send" id="btnSend" onclick="doSendMessage()">Send to Orchestrator</button>
+  </div>
+
 
 </div>
 
@@ -445,6 +490,9 @@
   const rawToggle = document.getElementById("rawToggle");
   const terminalsList = document.getElementById("terminalsList");
   const terminalsEmpty = document.getElementById("terminalsEmpty");
+  const msgRow = document.getElementById("msgRow");
+  const msgInput = document.getElementById("msgInput");
+  const btnSend = document.getElementById("btnSend");
 
   rawToggle.addEventListener("change", function() {
     if (rawToggle.checked) {
@@ -491,8 +539,18 @@
     // Log file path
     if (/^\[Log:\s/.test(line)) return { type: "logpath", icon: "#", msg: "Log file", detail: line.replace(/^\[Log:\s*/, "").replace(/\]$/, "") };
 
+    // User messages — live delivery or queued
+    if (/^\[User → orchestrator:/.test(line)) {
+      const text = line.replace(/^\[User → orchestrator:\s*/, "").replace(/\]$/, "");
+      return { type: "usermsg", icon: "»", msg: "You (live): " + text };
+    }
+    if (/^\[User message queued:/.test(line)) {
+      const text = line.replace(/^\[User message queued:\s*/, "").replace(/\]$/, "");
+      return { type: "usermsg", icon: "»", msg: "You (queued): " + text };
+    }
+
     // Rate limit / recovery info lines
-    if (/^\[Rate limit|^\[Controller exited.*rate limit|^\[Waiting for rate limit|^\[Rate limit timer|^\[Continuation mode|^\[Rate limit reset/.test(line)) {
+    if (/^\[Rate limit|^\[Controller exited.*rate limit|^\[Waiting for rate limit|^\[Rate limit timer|^\[Continuation mode|^\[Rate limit reset|^\[2-hour auto/.test(line)) {
       return { type: "info", icon: "!", msg: line.trim() };
     }
 
@@ -574,6 +632,9 @@
     githubRepoInput.disabled = running;
     workDirInput.disabled = running;
     btnShutdown.disabled = false;  // always clickable
+    // Show the message box only while a session is active
+    msgRow.style.display = running ? "" : "none";
+    if (!running) msgInput.value = "";
   }
 
   function isNearBottom(el) {
@@ -865,6 +926,35 @@
     statusText.textContent = "Server shut down";
     statusDot.className = "status-dot stopped";
   };
+
+  window.doSendMessage = async function() {
+    const msg = msgInput.value.trim();
+    if (!msg || !isRunning) return;
+    msgInput.value = "";
+    btnSend.disabled = true;
+    try {
+      const res = await fetch("/api/send-message", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        alert(data.error || "Failed to send message");
+        msgInput.value = msg; // restore so user can retry
+      }
+    } catch (_) {
+      alert("Failed to connect to server");
+      msgInput.value = msg;
+    } finally {
+      btnSend.disabled = false;
+      msgInput.focus();
+    }
+  };
+
+  msgInput.addEventListener("keydown", function(e) {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); doSendMessage(); }
+  });
 
   goalInput.addEventListener("keydown", function(e) {
     // Textarea uses plain Enter for newlines — use Ctrl/Cmd+Enter to start

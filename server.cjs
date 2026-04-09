@@ -13,6 +13,12 @@ const TMUX_CONTROL = path.join(__dirname, "tmux-control.cjs");
 const PUBLIC_DIR = path.join(__dirname, "public");
 const MAX_BUFFER_LINES = 500;
 const POLL_INTERVAL_MS = 2000;
+// Watchdog: nudge the controller if it goes quiet
+const WATCHDOG_QUIET_MS  = 30000;  // quiet threshold before nudging (30s)
+const WATCHDOG_CHECK_MS  = 10000;  // how often we check (10s)
+const WATCHDOG_MAX_NUDGES = 10;    // give up after this many nudges without output
+// Marker the orchestrator outputs to signal it has finished a work session
+const COMPLETION_MARKER = "##SUPERVIBES_DONE##";
 
 // --- SYSTEM_PROMPT (reused from start.cjs) ---
 
@@ -133,6 +139,7 @@ You MUST verify that everything works before declaring the task done. NEVER hand
 - Use descriptive session names that match the task purpose
 - DEFAULT to running multiple terminals in parallel — speed matters more than caution
 - Stagger terminal starts 12-15s apart; send each its task immediately after starting it
+- When you have fully completed all assigned tasks and verified everything works, signal completion by outputting this exact text on a line by itself: ${COMPLETION_MARKER}
 `;
 
 // --- State ---
@@ -160,7 +167,14 @@ const state = {
   rateLimitDetected: false,
   rateLimitResetTime: null,   // Date object
   rateLimitTimer: null,
+  rateLimitBackupTimer: null, // fires every 2h when primary timer > 2h (handles incorrect parse)
   rateLimitResumedAt: null,
+  // User messages queued for delivery to orchestrator on next spawn
+  pendingMessages: [],
+  // Watchdog — detects when the controller goes quiet and nudges it
+  lastControllerOutputAt: 0,
+  watchdogNudges: 0,
+  watchdogInterval: null,
 };
 
 // --- Helpers ---
@@ -280,6 +294,52 @@ function closeLog() {
   }
 }
 
+// --- Controller stdin / watchdog ---
+
+function sendToController(text) {
+  if (!state.controllerProcess) return false;
+  const stdin = state.controllerProcess.stdin;
+  if (!stdin || stdin.destroyed || stdin.writableEnded) return false;
+  try {
+    stdin.write(text + "\n");
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function startWatchdog() {
+  stopWatchdog();
+  state.watchdogNudges = 0;
+  state.lastControllerOutputAt = Date.now();
+  state.watchdogInterval = setInterval(() => {
+    if (!state.controllerProcess || !state.running) { stopWatchdog(); return; }
+    const quietMs = Date.now() - state.lastControllerOutputAt;
+    if (quietMs < WATCHDOG_QUIET_MS) return;
+    if (state.watchdogNudges >= WATCHDOG_MAX_NUDGES) {
+      const gaveUpMsg = `[Watchdog: ${WATCHDOG_MAX_NUDGES} nudges sent with no response — stopping nudges]`;
+      pushControllerLine(gaveUpMsg);
+      broadcast("controller", { line: gaveUpMsg });
+      stopWatchdog();
+      return;
+    }
+    state.watchdogNudges++;
+    // Reset the clock so we don't fire again immediately
+    state.lastControllerOutputAt = Date.now();
+    const nudgeMsg = `[Watchdog: quiet for ${Math.round(quietMs / 1000)}s — nudge #${state.watchdogNudges}]`;
+    pushControllerLine(nudgeMsg);
+    broadcast("controller", { line: nudgeMsg });
+    sendToController("continue");
+  }, WATCHDOG_CHECK_MS);
+}
+
+function stopWatchdog() {
+  if (state.watchdogInterval) {
+    clearInterval(state.watchdogInterval);
+    state.watchdogInterval = null;
+  }
+}
+
 // --- Rate limit helpers ---
 
 /**
@@ -351,6 +411,42 @@ function detectRateLimit(text) {
   });
 }
 
+function doRateLimitResume(reason) {
+  if (state.rateLimitTimer) { clearTimeout(state.rateLimitTimer); state.rateLimitTimer = null; }
+  if (state.rateLimitBackupTimer) { clearInterval(state.rateLimitBackupTimer); state.rateLimitBackupTimer = null; }
+
+  broadcast("ratelimit", { active: false });
+  state.rateLimitDetected = false;
+  state.rateLimitResetTime = null;
+  state.rateLimitResumedAt = Date.now();
+
+  // If the controller is still alive (it paused at the rate limit rather than
+  // exiting), just send "Continue" — no new process needed, full context preserved.
+  if (sendToController("Continue")) {
+    const resumeMsg = `[${reason} — sent Continue to live orchestrator]`;
+    pushControllerLine(resumeMsg);
+    broadcast("controller", { line: resumeMsg });
+    // Reset the watchdog so we don't immediately nudge
+    state.lastControllerOutputAt = Date.now();
+    state.watchdogNudges = 0;
+    return;
+  }
+
+  // Controller exited — spawn a new one in continuation mode
+  const resumeMsg = `[${reason} — orchestrator exited, spawning continuation]`;
+  pushControllerLine(resumeMsg);
+  broadcast("controller", { line: resumeMsg });
+  spawnController(
+    state.goal,
+    state.terminalCount,
+    state.model,
+    state.currentIteration,
+    state.workerModel,
+    state.workDir,
+    true // continuationMode
+  );
+}
+
 function startRateLimitTimer() {
   if (!state.rateLimitResetTime || state.rateLimitTimer) return;
 
@@ -363,32 +459,38 @@ function startRateLimitTimer() {
 
   state.rateLimitTimer = setTimeout(() => {
     state.rateLimitTimer = null;
-
-    const resumeMsg = "[Rate limit reset — spawning new orchestrator to continue work...]";
-    pushControllerLine(resumeMsg);
-    broadcast("controller", { line: resumeMsg });
-    broadcast("ratelimit", { active: false });
-
-    // Spawn new controller in continuation mode
-    state.rateLimitDetected = false;
-    state.rateLimitResetTime = null;
-    state.rateLimitResumedAt = Date.now();
-    spawnController(
-      state.goal,
-      state.terminalCount,
-      state.model,
-      state.currentIteration,
-      state.workerModel,
-      state.workDir,
-      true // continuationMode
-    );
+    doRateLimitResume("Rate limit reset");
   }, delayMs);
+
+  // If the timer is set for more than 2 hours, the parsed reset time may be wrong
+  // (e.g. a 24-hour countdown when the real reset is 5 hours away).
+  // Set a backup that fires every 2 hours to attempt an early resume.
+  const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
+  if (delayMs > TWO_HOURS_MS && !state.rateLimitBackupTimer) {
+    const backupMsg = "[2-hour auto-retry enabled — will attempt early resume every 2h in case timer was parsed incorrectly]";
+    pushControllerLine(backupMsg);
+    broadcast("controller", { line: backupMsg });
+
+    state.rateLimitBackupTimer = setInterval(() => {
+      // Stop the interval if rate limit is no longer active or a run is underway
+      if (!state.rateLimitDetected || state.running) {
+        clearInterval(state.rateLimitBackupTimer);
+        state.rateLimitBackupTimer = null;
+        return;
+      }
+      doRateLimitResume("2-hour auto-retry");
+    }, TWO_HOURS_MS);
+  }
 }
 
 function cancelRateLimitTimer() {
   if (state.rateLimitTimer) {
     clearTimeout(state.rateLimitTimer);
     state.rateLimitTimer = null;
+  }
+  if (state.rateLimitBackupTimer) {
+    clearInterval(state.rateLimitBackupTimer);
+    state.rateLimitBackupTimer = null;
   }
   state.rateLimitDetected = false;
   state.rateLimitResetTime = null;
@@ -538,24 +640,54 @@ The project below was already built in a previous round. Your job now:
 Original goal for context: ${goal}`;
   }
 
-  return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}${workDirInstruction}\n\n${goalSection}`;
+  // Include any queued user messages so the new orchestrator sees them immediately
+  let messagesSection = "";
+  if (state.pendingMessages.length > 0) {
+    const msgList = state.pendingMessages.map(m => `- ${m.text}`).join("\n");
+    messagesSection = `\n\n## User Instructions\n\nThe user sent the following instructions while the previous session was running. Please acknowledge and incorporate them:\n\n${msgList}`;
+  }
+
+  return `${SYSTEM_PROMPT}\n\n## Terminal count\n\n${terminalInstruction}\n\n## Model\n\n${modelInstruction}${workDirInstruction}\n\n${goalSection}${messagesSection}`;
+}
+
+// Build the short prompt for a follow-on improvement iteration.
+// The controller already has the system prompt and full context in its window,
+// so this only needs to describe what to do next.
+function buildIterationPrompt(iteration, goal) {
+  return `Great work — that phase is complete.
+
+## Iteration ${iteration} — Improvement Round
+
+Review the project you just built and improve it across four steps:
+1. **Code review**: read through the codebase, identify bugs, code quality issues, missing error handling, UX problems, and performance opportunities
+2. **Fix and improve**: address every issue you found — refactor, fix bugs, improve code quality
+3. **Add 1 new feature**: choose something meaningful that fits naturally and implement it fully
+4. **Verify everything**: run the project, confirm it works including your new feature, ensure nothing is broken
+
+When you are completely done with all tasks and verification, output the marker ${COMPLETION_MARKER} on a line by itself.
+
+Original goal for context: ${goal}`;
 }
 
 function spawnController(goal, terminalCount, model, iteration, workerModel, workDir, continuationMode) {
   const prompt = buildPrompt(goal, terminalCount, model, iteration || 0, workerModel, workDir, continuationMode || false);
+  // Pending messages are now in the prompt — clear the queue
+  state.pendingMessages = [];
 
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
 
+  // Run claude in interactive mode (no -p flag) with stdin open as a pipe.
+  // This lets us inject messages at any time and keeps context alive across
+  // rate-limit pauses and (if configured) multi-iteration runs.
   const child = spawn("claude", [
     "--dangerously-skip-permissions",
-    "-p", prompt,
     "--model", model || "sonnet",
     "--output-format", "stream-json",
     "--verbose",
   ], {
     cwd: __dirname,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env,
   });
 
@@ -584,7 +716,17 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     broadcast("controller", { line: contLine });
   }
 
+  // Send the initial prompt via stdin (equivalent to the user typing it)
+  child.stdin.write(prompt + "\n");
+
   let lineBuf = "";
+
+  const emitLine = (l) => {
+    pushControllerLine(l);
+    broadcast("controller", { line: l });
+    checkForRateLimit(l);
+    checkForCompletion(l);
+  };
 
   const processJsonLine = (raw) => {
     if (!raw.trim()) return;
@@ -606,40 +748,20 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
             }
           }
           if (line) {
-            for (const l of line.split("\n")) {
-              pushControllerLine(l);
-              broadcast("controller", { line: l });
-              checkForRateLimit(l);
-            }
+            for (const l of line.split("\n")) { emitLine(l); }
             line = null;
           }
         }
       } else if (msg.type === "result" && msg.result) {
         const text = typeof msg.result === "string" ? msg.result : (msg.result.text || "");
-        if (text) {
-          for (const l of text.split("\n")) {
-            pushControllerLine(l);
-            broadcast("controller", { line: l });
-            checkForRateLimit(l);
-          }
-        }
+        if (text) { for (const l of text.split("\n")) { emitLine(l); } }
       } else if (msg.type === "content_block_delta" && msg.delta) {
         const text = msg.delta.text || "";
-        if (text) {
-          for (const l of text.split("\n")) {
-            if (l) {
-              pushControllerLine(l);
-              broadcast("controller", { line: l });
-              checkForRateLimit(l);
-            }
-          }
-        }
+        if (text) { for (const l of text.split("\n")) { if (l) emitLine(l); } }
       }
     } catch (_) {
       // Not valid JSON, emit raw
-      pushControllerLine(raw);
-      broadcast("controller", { line: raw });
-      checkForRateLimit(raw);
+      emitLine(raw);
     }
   };
 
@@ -650,16 +772,89 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     }
   };
 
-  const handleStdout = (chunk) => {
-    lineBuf += chunk.toString();
-    const parts = lineBuf.split("\n");
-    lineBuf = parts.pop();
-    for (const line of parts) {
-      processJsonLine(line);
+  // When the controller signals it finished a phase, either start the next
+  // iteration (by writing the next prompt to stdin) or close stdin to let
+  // the session end naturally.
+  const checkForCompletion = (text) => {
+    if (!text.includes(COMPLETION_MARKER)) return;
+    if (state.stopped) return;
+
+    if (state.currentIteration < state.iterations) {
+      state.currentIteration++;
+      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
+      pushControllerLine(iterMsg);
+      broadcast("controller", { line: iterMsg });
+      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
+
+      // Reset watchdog for the new phase
+      state.watchdogNudges = 0;
+      state.lastControllerOutputAt = Date.now();
+
+      // Compact the conversation history before the next iteration so the
+      // accumulated terminal reads and tool-call scaffolding don't balloon the
+      // context window. We give /compact ~10s to finish before sending the next
+      // prompt — compression is fast, but we want its result event to land first
+      // so the new prompt isn't included in what gets summarised.
+      const compactMsg = "[Sending /compact to reduce context before next iteration]";
+      pushControllerLine(compactMsg);
+      broadcast("controller", { line: compactMsg });
+
+      const compactSentAt = Date.now();
+      sendToController("/compact");
+
+      // Send the next iteration prompt as soon as /compact's output goes quiet
+      // (2s of silence after we see output from it). Fall back to 10s if the
+      // quiet window never clearly arrives — e.g. if the response is ambiguous.
+      let compactDone = false;
+      const sendNextIterationPrompt = (via) => {
+        if (compactDone || state.stopped || !state.controllerProcess) return;
+        compactDone = true;
+        clearInterval(compactWatcher);
+        clearTimeout(compactFallback);
+        const readyMsg = `[/compact finished (${via}) — starting iteration ${state.currentIteration}]`;
+        pushControllerLine(readyMsg);
+        broadcast("controller", { line: readyMsg });
+        const iterPrompt = buildIterationPrompt(state.currentIteration, state.goal);
+        sendToController(iterPrompt);
+      };
+
+      const compactWatcher = setInterval(() => {
+        if (state.stopped || !state.controllerProcess) { clearInterval(compactWatcher); return; }
+        // Only fire once output has actually arrived after the /compact was sent,
+        // then gone quiet for ≥2s — avoids triggering on pre-existing silence.
+        const sawOutputAfterSend = state.lastControllerOutputAt > compactSentAt;
+        const quietMs = Date.now() - state.lastControllerOutputAt;
+        if (sawOutputAfterSend && quietMs >= 2000) sendNextIterationPrompt("quiet detect");
+      }, 500);
+
+      const compactFallback = setTimeout(
+        () => sendNextIterationPrompt("10s fallback"),
+        10000
+      );
+    } else {
+      // All iterations done — close stdin so the session exits cleanly
+      const doneMsg = "[All tasks complete — closing orchestrator session]";
+      pushControllerLine(doneMsg);
+      broadcast("controller", { line: doneMsg });
+      try { child.stdin.end(); } catch (_) {}
     }
   };
 
+  const handleStdout = (chunk) => {
+    // Any output means the controller is alive — reset the watchdog clock
+    state.lastControllerOutputAt = Date.now();
+    state.watchdogNudges = 0;
+
+    lineBuf += chunk.toString();
+    const parts = lineBuf.split("\n");
+    lineBuf = parts.pop();
+    for (const line of parts) { processJsonLine(line); }
+  };
+
   const handleStderr = (chunk) => {
+    state.lastControllerOutputAt = Date.now();
+    state.watchdogNudges = 0;
+
     const text = stripAnsi(chunk.toString());
     for (const line of text.split("\n")) {
       if (line.trim()) {
@@ -674,11 +869,9 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
   child.stderr.on("data", handleStderr);
 
   child.on("exit", (code) => {
+    stopWatchdog();
     // Flush remaining buffer
-    if (lineBuf.length > 0) {
-      processJsonLine(lineBuf);
-      lineBuf = "";
-    }
+    if (lineBuf.length > 0) { processJsonLine(lineBuf); lineBuf = ""; }
     state.controllerProcess = null;
     stopPolling();
 
@@ -687,7 +880,6 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
       const exitLine = `[Controller exited with code ${code} — rate limit recovery timer started]`;
       pushControllerLine(exitLine);
       broadcast("controller", { line: exitLine });
-      // Keep workers alive; start timer to resume
       startRateLimitTimer();
       return;
     }
@@ -697,48 +889,43 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     state.sessions = [];
     broadcast("terminals", { sessions: [] });
 
-    // Check if we should start the next iteration
-    if (code === 0 && state.currentIteration < state.iterations && !state.stopped) {
-      state.currentIteration++;
-      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
-      pushControllerLine(iterMsg);
-      broadcast("controller", { line: iterMsg });
-      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
-
-      setTimeout(() => {
-        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
-      }, 2000);
-    } else {
-      state.running = false;
-      const reason = state.stopped ? "Stopped by user" : `Controller exited with code ${code}`;
-      pushControllerLine(`\n[${reason}]`);
-      broadcast("controller", { line: `\n[${reason}]` });
-      if (state.iterations > 0 && code === 0 && !state.stopped) {
-        pushControllerLine(`[All ${state.iterations} iteration(s) complete]`);
-        broadcast("controller", { line: `[All ${state.iterations} iteration(s) complete]` });
-      }
-      broadcast("status", { running: false });
-      state.stopped = false;
-      closeLog();
+    state.running = false;
+    const reason = state.stopped ? "Stopped by user" : `Controller exited (code ${code})`;
+    pushControllerLine(`\n[${reason}]`);
+    broadcast("controller", { line: `\n[${reason}]` });
+    if (state.iterations > 0 && !state.stopped) {
+      pushControllerLine(`[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]`);
+      broadcast("controller", { line: `[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]` });
     }
+    broadcast("status", { running: false });
+    state.stopped = false;
+    closeLog();
   });
 
   startPolling();
+  startWatchdog();
 }
 
 function stopController() {
   state.stopped = true;
 
-  // Cancel any pending rate limit timer
+  // Cancel any pending rate limit timers
   if (state.rateLimitTimer) {
     clearTimeout(state.rateLimitTimer);
     state.rateLimitTimer = null;
     broadcast("ratelimit", { active: false });
   }
+  if (state.rateLimitBackupTimer) {
+    clearInterval(state.rateLimitBackupTimer);
+    state.rateLimitBackupTimer = null;
+  }
   state.rateLimitDetected = false;
   state.rateLimitResetTime = null;
 
+  stopWatchdog();
+
   if (state.controllerProcess) {
+    try { state.controllerProcess.stdin.end(); } catch (_) {}
     state.controllerProcess.kill("SIGTERM");
     setTimeout(() => {
       if (state.controllerProcess) {
@@ -842,6 +1029,32 @@ const server = http.createServer(async (req, res) => {
     }
     cancelRateLimitTimer();
     return sendJson(res, 200, { ok: true });
+  }
+
+  if (pathname === "/api/send-message" && req.method === "POST") {
+    const body = await parseBody(req);
+    const message = (body.message || "").trim();
+    if (!message) return sendJson(res, 400, { error: "Message is required" });
+
+    const delivered = sendToController(message);
+
+    if (delivered) {
+      // Message went straight into the live conversation
+      const displayLine = `[User → orchestrator: ${message}]`;
+      pushControllerLine(displayLine);
+      broadcast("controller", { line: displayLine });
+      // A user message is fresh output — reset the watchdog
+      state.lastControllerOutputAt = Date.now();
+      state.watchdogNudges = 0;
+    } else {
+      // No live controller — queue for the next spawn
+      state.pendingMessages.push({ text: message, time: new Date() });
+      const displayLine = `[User message queued: ${message}]`;
+      pushControllerLine(displayLine);
+      broadcast("controller", { line: displayLine });
+    }
+
+    return sendJson(res, 200, { ok: true, delivered });
   }
 
   if (pathname === "/api/shutdown" && req.method === "POST") {
