@@ -412,12 +412,15 @@ function detectRateLimit(text) {
   pushControllerLine(msg);
   broadcast("controller", { line: msg });
 
-  // Broadcast timer state to all clients immediately
   broadcast("ratelimit", {
     active: true,
     resetTime: resetTime.toISOString(),
     resumeTime: resumeTime.toISOString(),
   });
+
+  // With stream-json the process stays alive (stdin pipe open), so the exit
+  // handler won't fire. Start the recovery timer here directly.
+  startRateLimitTimer();
 }
 
 function doRateLimitResume(reason) {
@@ -763,6 +766,9 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
           pushControllerLine(msg2);
           broadcast("controller", { line: msg2 });
           broadcast("ratelimit", { active: true, resetTime: resetTime.toISOString(), resumeTime: resumeTime.toISOString() });
+          // Process stays alive with stdin open — start recovery timer now
+          // (can't rely on the exit handler, which may never fire).
+          startRateLimitTimer();
         }
         return;
       }
