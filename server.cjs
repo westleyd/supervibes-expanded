@@ -322,6 +322,7 @@ function startWatchdog() {
   state.lastControllerOutputAt = Date.now();
   state.watchdogInterval = setInterval(() => {
     if (!state.controllerProcess || !state.running) { stopWatchdog(); return; }
+    if (state.rateLimitDetected) return;  // rate limit active — don't nudge
     const quietMs = Date.now() - state.lastControllerOutputAt;
     if (quietMs < WATCHDOG_QUIET_MS) return;
     if (state.watchdogNudges >= WATCHDOG_MAX_NUDGES) {
