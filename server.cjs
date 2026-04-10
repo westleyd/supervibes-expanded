@@ -175,9 +175,17 @@ const state = {
   lastControllerOutputAt: 0,
   watchdogNudges: 0,
   watchdogInterval: null,
+  // /compact event-driven handoff
+  onCompactComplete: null,
+  compactFallbackTimer: null,
 };
 
 // --- Helpers ---
+
+// Wrap a plain-text message in the stream-json envelope claude expects on stdin
+function makeStreamJsonMsg(content) {
+  return JSON.stringify({ type: "user", message: { role: "user", content } }) + "\n";
+}
 
 function stripAnsi(str) {
   return str.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, "");
@@ -301,7 +309,7 @@ function sendToController(text) {
   const stdin = state.controllerProcess.stdin;
   if (!stdin || stdin.destroyed || stdin.writableEnded) return false;
   try {
-    stdin.write(text + "\n");
+    stdin.write(makeStreamJsonMsg(text));
     return true;
   } catch (_) {
     return false;
@@ -420,7 +428,18 @@ function doRateLimitResume(reason) {
   state.rateLimitResetTime = null;
   state.rateLimitResumedAt = Date.now();
 
-  // Controller exited (-p mode always exits) — spawn a new one in continuation mode
+  // If the controller process is still alive (stdin pipe open), inject "Continue"
+  // directly — no need to spawn a new process.
+  if (sendToController("Continue")) {
+    const resumeMsg = `[${reason} — sent Continue to live orchestrator]`;
+    pushControllerLine(resumeMsg);
+    broadcast("controller", { line: resumeMsg });
+    state.lastControllerOutputAt = Date.now();
+    state.watchdogNudges = 0;
+    return;
+  }
+
+  // Controller exited — spawn a new one in continuation mode
   const resumeMsg = `[${reason} — spawning continuation orchestrator]`;
   pushControllerLine(resumeMsg);
   broadcast("controller", { line: resumeMsg });
@@ -480,6 +499,11 @@ function cancelRateLimitTimer() {
     clearInterval(state.rateLimitBackupTimer);
     state.rateLimitBackupTimer = null;
   }
+  if (state.compactFallbackTimer) {
+    clearTimeout(state.compactFallbackTimer);
+    state.compactFallbackTimer = null;
+  }
+  state.onCompactComplete = null;
   state.rateLimitDetected = false;
   state.rateLimitResetTime = null;
   state.rateLimitResumedAt = null;
@@ -665,15 +689,20 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
   const env = Object.assign({}, process.env);
   delete env.CLAUDECODE;
 
+  // Use --input-format stream-json so we can keep stdin open and inject
+  // messages (user instructions, /compact, iteration prompts, Continue) at
+  // any time without needing a TTY.  The process lives until we call
+  // child.stdin.end(), giving us true multi-turn orchestration in one session.
   const child = spawn("claude", [
     "--dangerously-skip-permissions",
-    "-p", prompt,
-    "--model", model || "sonnet",
+    "--print",
+    "--input-format", "stream-json",
     "--output-format", "stream-json",
     "--verbose",
+    "--model", model || "sonnet",
   ], {
     cwd: __dirname,
-    stdio: ["ignore", "pipe", "pipe"],
+    stdio: ["pipe", "pipe", "pipe"],
     env,
   });
 
@@ -686,10 +715,11 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
   state.workDir = workDir || "";
   state.controllerOutput = [];
   state.sessions = [];
+  state.onCompactComplete = null;
+  if (state.compactFallbackTimer) { clearTimeout(state.compactFallbackTimer); state.compactFallbackTimer = null; }
 
   broadcast("status", { running: true, goal, terminalCount });
 
-  // Emit log file path as first line so UI and log both show it
   if (state.logFilePath) {
     const logLine = `[Log: ${state.logFilePath}]`;
     pushControllerLine(logLine);
@@ -702,12 +732,16 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     broadcast("controller", { line: contLine });
   }
 
+  // Deliver the initial prompt (and any queued user messages) via stdin
+  child.stdin.write(makeStreamJsonMsg(prompt));
+  state.pendingMessages = [];  // already included in prompt via buildPrompt
+
   let lineBuf = "";
 
   const emitLine = (l) => {
     pushControllerLine(l);
     broadcast("controller", { line: l });
-    checkForRateLimit(l);
+    checkForTextRateLimit(l);
     checkForCompletion(l);
   };
 
@@ -715,8 +749,43 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
     if (!raw.trim()) return;
     try {
       const msg = JSON.parse(raw);
-      let line = null;
 
+      // --- Rate limit event (reliable Unix timestamp, prefer over text parsing) ---
+      if (msg.type === "rate_limit_event" && msg.rate_limit_info) {
+        const info = msg.rate_limit_info;
+        if (info.status !== "allowed" && info.resetsAt && !state.rateLimitDetected) {
+          const resetTime = new Date(info.resetsAt * 1000);
+          state.rateLimitDetected = true;
+          state.rateLimitResetTime = resetTime;
+          const resumeTime = new Date(resetTime.getTime() + 20000);
+          const msg2 = `[Rate limit detected via event — session resets at ${resetTime.toLocaleString()} — will auto-resume ~20s after]`;
+          pushControllerLine(msg2);
+          broadcast("controller", { line: msg2 });
+          broadcast("ratelimit", { active: true, resetTime: resetTime.toISOString(), resumeTime: resumeTime.toISOString() });
+        }
+        return;
+      }
+
+      // --- /compact lifecycle events ---
+      if (msg.type === "system" && msg.subtype === "status" && msg.status === "compacting") {
+        const compactingMsg = "[/compact: compacting conversation history...]";
+        pushControllerLine(compactingMsg);
+        broadcast("controller", { line: compactingMsg });
+        return;
+      }
+      if (msg.type === "system" && msg.subtype === "compact_boundary") {
+        const preTokens = msg.compact_metadata && msg.compact_metadata.pre_tokens;
+        const boundaryMsg = `[/compact complete — context reduced${preTokens ? ` (was ${preTokens.toLocaleString()} tokens)` : ""}]`;
+        pushControllerLine(boundaryMsg);
+        broadcast("controller", { line: boundaryMsg });
+        // Fire the pending iteration callback now that compaction is confirmed done
+        if (state.compactFallbackTimer) { clearTimeout(state.compactFallbackTimer); state.compactFallbackTimer = null; }
+        if (state.onCompactComplete) { const cb = state.onCompactComplete; state.onCompactComplete = null; cb(); }
+        return;
+      }
+
+      // --- Normal output ---
+      let line = null;
       if (msg.type === "assistant" && msg.message) {
         const content = msg.message.content || [];
         for (const block of content) {
@@ -724,16 +793,9 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
             line = block.text;
           } else if (block.type === "tool_use") {
             const input = block.input || {};
-            if (input.command) {
-              line = "$ " + input.command;
-            } else {
-              line = "[tool: " + block.name + "]";
-            }
+            line = input.command ? "$ " + input.command : "[tool: " + block.name + "]";
           }
-          if (line) {
-            for (const l of line.split("\n")) { emitLine(l); }
-            line = null;
-          }
+          if (line) { for (const l of line.split("\n")) { emitLine(l); } line = null; }
         }
       } else if (msg.type === "result" && msg.result) {
         const text = typeof msg.result === "string" ? msg.result : (msg.result.text || "");
@@ -743,32 +805,65 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
         if (text) { for (const l of text.split("\n")) { if (l) emitLine(l); } }
       }
     } catch (_) {
-      // Not valid JSON, emit raw
       emitLine(raw);
     }
   };
 
-  const checkForRateLimit = (text) => {
+  // Fallback text-based rate limit detection (catches messages in assistant text)
+  const checkForTextRateLimit = (text) => {
     if (!state.rateLimitDetected &&
         (/you'?ve hit your (rate )?limit/i.test(text) || /resets\s+\d+[:\d]*[ap]m\s*\(/i.test(text))) {
       detectRateLimit(text);
     }
   };
 
-  // Log when the orchestrator signals it has finished a phase.
-  // Iteration management is handled by the exit handler below (respawn per iteration).
+  // When the orchestrator signals it finished a phase, send /compact then the
+  // next iteration prompt (or close stdin if all iterations are done).
   const checkForCompletion = (text) => {
     if (!text.includes(COMPLETION_MARKER)) return;
-    const msg = "[Orchestrator signaled task complete]";
-    pushControllerLine(msg);
-    broadcast("controller", { line: msg });
+    if (state.stopped) return;
+
+    if (state.currentIteration < state.iterations) {
+      state.currentIteration++;
+      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
+      pushControllerLine(iterMsg);
+      broadcast("controller", { line: iterMsg });
+      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
+
+      const compactMsg = "[Sending /compact to reduce context before next iteration]";
+      pushControllerLine(compactMsg);
+      broadcast("controller", { line: compactMsg });
+      sendToController("/compact");
+
+      // Fire when compact_boundary event arrives — no polling, no guessing
+      state.onCompactComplete = () => {
+        if (state.stopped || !state.controllerProcess) return;
+        state.watchdogNudges = 0;
+        state.lastControllerOutputAt = Date.now();
+        sendToController(buildIterationPrompt(state.currentIteration, state.goal));
+      };
+      // 30s fallback in case compact_boundary never arrives
+      state.compactFallbackTimer = setTimeout(() => {
+        state.compactFallbackTimer = null;
+        if (state.onCompactComplete) {
+          const fallbackMsg = "[/compact: no compact_boundary event — proceeding after 30s fallback]";
+          pushControllerLine(fallbackMsg);
+          broadcast("controller", { line: fallbackMsg });
+          const cb = state.onCompactComplete; state.onCompactComplete = null; cb();
+        }
+      }, 30000);
+
+    } else {
+      const doneMsg = "[All tasks complete — closing orchestrator session]";
+      pushControllerLine(doneMsg);
+      broadcast("controller", { line: doneMsg });
+      try { child.stdin.end(); } catch (_) {}
+    }
   };
 
   const handleStdout = (chunk) => {
-    // Any output means the controller is alive — reset the watchdog clock
     state.lastControllerOutputAt = Date.now();
     state.watchdogNudges = 0;
-
     lineBuf += chunk.toString();
     const parts = lineBuf.split("\n");
     lineBuf = parts.pop();
@@ -778,13 +873,12 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
   const handleStderr = (chunk) => {
     state.lastControllerOutputAt = Date.now();
     state.watchdogNudges = 0;
-
     const text = stripAnsi(chunk.toString());
     for (const line of text.split("\n")) {
       if (line.trim()) {
         pushControllerLine(line);
         broadcast("controller", { line });
-        checkForRateLimit(line);
+        checkForTextRateLimit(line);
       }
     }
   };
@@ -794,45 +888,32 @@ function spawnController(goal, terminalCount, model, iteration, workerModel, wor
 
   child.on("exit", (code) => {
     stopWatchdog();
-    // Flush remaining buffer
+    if (state.compactFallbackTimer) { clearTimeout(state.compactFallbackTimer); state.compactFallbackTimer = null; }
+    state.onCompactComplete = null;
     if (lineBuf.length > 0) { processJsonLine(lineBuf); lineBuf = ""; }
     state.controllerProcess = null;
     stopPolling();
 
-    // If rate limit was detected, don't stop workers — start the resume timer
+    // If rate limit detected and not manually stopped, start the recovery timer
     if (state.rateLimitDetected && !state.stopped) {
-      const exitLine = `[Controller exited with code ${code} — rate limit recovery timer started]`;
+      const exitLine = `[Controller exited (code ${code}) — rate limit recovery timer started]`;
       pushControllerLine(exitLine);
       broadcast("controller", { line: exitLine });
       startRateLimitTimer();
       return;
     }
 
-    // Normal exit: clean up tmux sessions
     try { runTmux("--stop-all"); } catch (_) {}
     state.sessions = [];
     broadcast("terminals", { sessions: [] });
-
-    // Start next iteration if configured
-    if (code === 0 && state.currentIteration < state.iterations && !state.stopped) {
-      state.currentIteration++;
-      const iterMsg = `\n--- Iteration ${state.currentIteration} of ${state.iterations} starting ---\n`;
-      pushControllerLine(iterMsg);
-      broadcast("controller", { line: iterMsg });
-      broadcast("status", { running: true, currentIteration: state.currentIteration, iterations: state.iterations });
-      setTimeout(() => {
-        spawnController(state.goal, state.terminalCount, state.model, state.currentIteration, state.workerModel, state.workDir);
-      }, 2000);
-      return;
-    }
 
     state.running = false;
     const reason = state.stopped ? "Stopped by user" : `Controller exited (code ${code})`;
     pushControllerLine(`\n[${reason}]`);
     broadcast("controller", { line: `\n[${reason}]` });
-    if (state.iterations > 0 && code === 0 && !state.stopped) {
-      pushControllerLine(`[All ${state.iterations} iteration(s) complete]`);
-      broadcast("controller", { line: `[All ${state.iterations} iteration(s) complete]` });
+    if (state.iterations > 0 && !state.stopped) {
+      pushControllerLine(`[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]`);
+      broadcast("controller", { line: `[Completed ${state.currentIteration} of ${state.iterations} iteration(s)]` });
     }
     broadcast("status", { running: false });
     state.stopped = false;
@@ -859,9 +940,18 @@ function stopController() {
   state.rateLimitDetected = false;
   state.rateLimitResetTime = null;
 
+  // Cancel any pending /compact callback and fallback timer
+  if (state.compactFallbackTimer) {
+    clearTimeout(state.compactFallbackTimer);
+    state.compactFallbackTimer = null;
+  }
+  state.onCompactComplete = null;
+
   stopWatchdog();
 
   if (state.controllerProcess) {
+    // Ask the process to exit cleanly by closing stdin first
+    try { state.controllerProcess.stdin.end(); } catch (_) {}
     state.controllerProcess.kill("SIGTERM");
     setTimeout(() => {
       if (state.controllerProcess) {
